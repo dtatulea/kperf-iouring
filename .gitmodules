@@ -1,3 +1,6 @@
 [submodule "ccan"]
 	path = ccan
 	url = https://github.com/rustyrussell/ccan.git
+[submodule "liburing"]
+	path = liburing
+	url = https://github.com/spikeh/liburing
