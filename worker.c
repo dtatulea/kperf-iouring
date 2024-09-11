@@ -36,9 +36,12 @@ struct worker_state {
 	struct timemono test_start;
 	struct timemono prev_loop;
 	unsigned int test_len_msec;
-	struct list_head connections;
-	struct io_uring *ring;
+
 	bool iou;
+	struct iou_opts iou_opts;
+	struct io_uring *ring;
+
+	struct list_head connections;
 };
 
 struct connection {
@@ -665,7 +668,7 @@ worker_handle_conn(struct worker_state *self, int fd, unsigned int events)
 
 /* == Main loop == */
 
-void NORETURN pworker_main(int fd)
+void NORETURN pworker_main(int fd, struct iou_opts *opts)
 {
 	struct worker_state self = { .main_sock = fd, };
 	struct epoll_event ev, events[32];
@@ -676,6 +679,8 @@ void NORETURN pworker_main(int fd)
 	int ret;
 
 	list_head_init(&self.connections);
+	self.iou_opts = *opts;
+	// TODO: set up func ptrs
 
 	/* Initialize the data buffer we send/receive, it must match
 	 * on both ends, this is how we catch data corruption (ekhm kTLS..)

@@ -10,6 +10,11 @@
 #include <ccan/compiler/compiler.h>
 #include <ccan/list/list.h>
 
+struct iou_opts {
+	bool enable;
+	bool zcrx;
+};
+
 struct server_session {
 	int cfd;
 	pid_t pid;
@@ -17,8 +22,8 @@ struct server_session {
 };
 
 struct server_session *
-server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen);
+server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen, struct iou_opts *opts);
 
-void NORETURN pworker_main(int fd);
+void NORETURN pworker_main(int fd, struct iou_opts *opts);
 
 #endif /* SERVER_H */

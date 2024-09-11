@@ -30,12 +30,15 @@ static struct {
 	char *pid_file;
 	bool kill;
 	bool server;
-	bool iou;
+	struct iou_opts iou_opts;
 } opt = {
 	.server		= true,
-	.iou		= false,
 	.service	= "18323",
 	.pid_file	= "/tmp/kperf.pid",
+	.iou_opts	= {
+		.enable		= false,
+		.zcrx		= false,
+	},
 };
 
 static const struct opt_table opts[] = {
@@ -50,7 +53,8 @@ static const struct opt_table opts[] = {
 			"Verbose mode (can be specified more than once)"),
  	OPT_WITHOUT_ARG("--usage|--help|-h", opt_usage_and_exit,
  			"kpeft server",	"Show this help message"),
-	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.iou, "Use io_uring"),
+	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.iou_opts.enable, "Use io_uring"),
+	OPT_WITHOUT_ARG("--iou_zcrx", opt_set_bool, &opt.iou_opts.zcrx, "io_uring: Use zero copy Rx"),
  	OPT_ENDTABLE
 };
 
@@ -184,7 +188,6 @@ int main(int argc, char *argv[])
 		err(1, "Failed to listen");
 
 	max_fd = num_fds == 1 || fds[0] > fds[1] ? fds[0] : fds[1];
-	printf("max_fd=%d\n", max_fd);
 
 	signal(SIGCHLD, chld_sig_handler);
 
@@ -227,7 +230,7 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
-		ses = server_session_spawn(cfd, &sockaddr, &addrlen);
+		ses = server_session_spawn(cfd, &sockaddr, &addrlen, &opt.iou_opts);
 		// NOTE: parent
 		if (ses)
 			server_session_add(ses);

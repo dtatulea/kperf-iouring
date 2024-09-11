@@ -36,10 +36,11 @@ struct session_state {
 	unsigned int connection_ids;
 	unsigned int worker_ids;
 	unsigned int test_ids;
+	struct iou_opts iou_opts;
+
 	struct list_head connections;
 	struct list_head pworkers;
 	struct list_head tests;
-	struct io_uring *ring;
 };
 
 struct connection {
@@ -57,6 +58,8 @@ struct pworker {
 	pid_t pid;
 	int busy;
 	struct list_node pworkers;
+	// TODO: configuration?
+	void (*main)(void);
 };
 
 struct test {
@@ -525,7 +528,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		// NOTE: child
 		close(p[0]);
-		pworker_main(p[1]);
+		pworker_main(p[1], &self->iou_opts);
 		exit(1);
 	}
 
@@ -769,7 +772,6 @@ static void session_handle_main_sock(struct session_state *self)
 {
 	struct kpm_header *hdr;
 
-	printf("session_handle_main_sock\n");
 	hdr = kpm_receive(self->main_sock);
 	if (!hdr) {
 		__kpm_dbg("<<", "ctrl recv failed");
@@ -892,7 +894,6 @@ static void session_handle_worker(struct session_state *self, int fd)
 {
 	struct kpm_header *hdr;
 
-	printf("session_handle_worker\n");
 	hdr = kpm_receive(fd);
 	if (!hdr) {
 		warnx("worker recv empty");
@@ -921,7 +922,6 @@ static void session_handle_accept_sock(struct session_state *self)
 	socklen_t addrlen;
 	int cfd;
 
-	printf("session_handle_accept_sock\n");
 	__kpm_trace(">>", "accept");
 
 	addrlen = sizeof(sockaddr);
@@ -932,7 +932,7 @@ static void session_handle_accept_sock(struct session_state *self)
 		session_new_conn(self, cfd);
 }
 
-static void server_session_loop(int fd)
+static void server_session_loop(int fd, struct iou_opts *opts)
 {
 	struct session_state self = { .main_sock = fd, };
 	struct epoll_event ev = {}, events[32];
@@ -941,6 +941,9 @@ static void server_session_loop(int fd)
 	list_head_init(&self.connections);
 	list_head_init(&self.pworkers);
 	list_head_init(&self.tests);
+
+	if (opts)
+		self.iou_opts = *opts;
 
 	self.epollfd = epoll_create1(0);
 	if (self.epollfd < 0)
@@ -979,16 +982,17 @@ static void server_session_loop(int fd)
 	}
 }
 
-static NORETURN void server_session(int fd)
+static NORETURN void server_session(int fd, struct iou_opts *opts)
 {
 	if (!kpm_xchg_hello(fd, NULL))
-		server_session_loop(fd);
+		server_session_loop(fd, opts);
 	close(fd);
 	exit(0);
 }
 
 struct server_session *
-server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen)
+server_session_spawn(int fd, struct sockaddr_in6 *addr,
+		     socklen_t *addrlen, struct iou_opts *opts)
 {
 	struct server_session *ses;
 
@@ -1011,5 +1015,5 @@ server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen)
 
 	// NOTE: child
 	free(ses);
-	server_session(fd);
+	server_session(fd, opts);
 }
