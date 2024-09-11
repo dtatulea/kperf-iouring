@@ -3,24 +3,28 @@
 CCAN_PATH := ./ccan
 
 CC=gcc
-CFLAGS=-std=gnu99   -I$(CCAN_PATH)   -O2   -W -Wall -Wextra -Wno-unused-parameter -Wshadow   -DDEBUG   -g
+CFLAGS=-std=gnu99   -I$(CCAN_PATH)   -I liburing/src/include   -O2   -W -Wall -Wextra -Wno-unused-parameter -Wshadow   -DDEBUG   -g
 
-LIBS=-lm -L$(CCAN_PATH) -pthread -lccan
+LIBS=-lm -L$(CCAN_PATH) -pthread -lccan -l:liburing.a -L liburing/src
 
 include $(wildcard *.d)
 
-all: server client units
+all: server client units liburing/src/liburing.a
 units: bipartite_match cpu_stat
 
-server: $(CCAN_PATH)/libccan.a server.o server_session.o proto.o worker.o cpu_stat.o tcp.o
+server: $(CCAN_PATH)/libccan.a liburing/src/liburing.a server.o server_session.o proto.o worker.o cpu_stat.o tcp.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-client: $(CCAN_PATH)/libccan.a client.o proto.o bipartite_match.o
+client: $(CCAN_PATH)/libccan.a liburing/src/liburing.a client.o proto.o bipartite_match.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 $(CCAN_PATH)/libccan.a:
 	make -C $(CCAN_PATH)/
 	ar rcs $(CCAN_PATH)/libccan.a $(CCAN_PATH)/ccan/*/*.o
+
+liburing/src/liburing.a:
+	make -C liburing
+$(OBJECTS): submodule_liburing
 
 clean:
 	rm -rf *.o *.d *~ bipartite_match cpu_stat
@@ -37,5 +41,5 @@ cpu_stat: $(CCAN_PATH)/libccan.a
 %.o: %.c
 	$(COMPILE.c) -MMD -o $@ $<
 
-.PHONY: all clean units ccan distclean
+.PHONY: all clean units ccan distclean submodule_liburing
 .DEFAULT_GOAL=all
