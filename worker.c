@@ -39,7 +39,10 @@ struct worker_state {
 
 	bool iou;
 	struct iou_opts iou_opts;
-	struct io_uring *ring;
+	struct io_uring ring;
+
+	int (*prep)(struct worker_state *);
+	void (*wait)(struct worker_state *);
 
 	struct list_head connections;
 };
@@ -282,7 +285,6 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 
 	for (i = 0; i < req->n_conns; i++) {
 		struct epoll_event ev = {};
-		struct io_uring_sqe *sqe;
 		struct connection *conn;
 		socklen_t info_len;
 		__u64 len;
@@ -344,12 +346,12 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 			self->iou = true;
 		}
 
-		/*
 		ev.events = EPOLLIN | EPOLLOUT;
 		ev.data.fd = conn->fd;
 		if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, conn->fd, &ev) < 0)
 			warn("Failed to modify poll out");
-		*/
+
+		/* FIXME: move into iou helper
 		if (conn->to_recv) {
 			size_t chunk;
 
@@ -366,6 +368,7 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 			if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, conn->fd, &ev) < 0)
 				warn("Failed to modify poll out");
 		}
+		*/
 	}
 
 	self->cpu_start = cpu_stat_snapshot(0);
@@ -643,7 +646,6 @@ worker_handle_conn(struct worker_state *self, int fd, unsigned int events)
 	static int warnd_unexpected_pi;
 	struct connection *conn;
 
-	// NOTE: actually does the work of sending or receiving data over the conn sock
 	conn = worker_find_connection_by_fd(self, fd);
 
 	if (events & EPOLLOUT) {
@@ -653,7 +655,6 @@ worker_handle_conn(struct worker_state *self, int fd, unsigned int events)
 			worker_send_disarm(self, conn, events);
 	}
 	if (events & EPOLLIN) {
-		errx(1, "Connection got unexpected EPOLLIN");
 		if (conn->to_recv) {
 			worker_handle_recv(self, conn);
 		} else if (!warnd_unexpected_pi) {
@@ -666,34 +667,55 @@ worker_handle_conn(struct worker_state *self, int fd, unsigned int events)
 		warnx("Connection has nothing to do %x", events);
 }
 
-/* == Main loop == */
-
-void NORETURN pworker_main(int fd, struct iou_opts *opts)
+static int
+worker_prep(struct worker_state *self)
 {
-	struct worker_state self = { .main_sock = fd, };
-	struct epoll_event ev, events[32];
-	unsigned char j;
-	int i, nfds;
-	struct io_uring_params p = {};
-	struct io_uring ring;
-	int ret;
+	struct epoll_event ev;
 
-	list_head_init(&self.connections);
-	self.iou_opts = *opts;
-	// TODO: set up func ptrs
-
-	/* Initialize the data buffer we send/receive, it must match
-	 * on both ends, this is how we catch data corruption (ekhm kTLS..)
-	 */
-	for (i = 0, j = 0; i < (int)ARRAY_SIZE(patbuf); i++, j++) {
-		j = j ?: 1;
-		patbuf[i] = j;
-	}
-
-	/* Init epoll */
-	self.epollfd = epoll_create1(0);
-	if (self.epollfd < 0)
+	self->epollfd = epoll_create1(0);
+	if (self->epollfd < 0)
 		err(5, "Failed to create epoll");
+
+	ev.events = EPOLLIN;
+	ev.data.fd = self->main_sock;
+	if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, self->main_sock, &ev) < 0)
+		err(6, "Failed to init epoll");
+
+	return 0;
+}
+
+static void
+worker_wait(struct worker_state *self)
+{
+	struct epoll_event events[32];
+	int i, nfds;
+
+	nfds = epoll_wait(self->epollfd, events, ARRAY_SIZE(events), -1);
+	if (nfds < 0)
+		err(7, "Failed to epoll");
+
+	for (i = 0; i < nfds; i++) {
+		struct epoll_event *e = &events[i];
+
+		if (e->data.fd == self->main_sock)
+			worker_handle_main_sock(self);
+		else
+			worker_handle_conn(self, e->data.fd, e->events);
+	}
+}
+
+static void
+worker_setup_fptrs(struct worker_state *self)
+{
+	self->prep = worker_prep;
+	self->wait = worker_wait;
+}
+
+static int
+worker_iou_prep(struct worker_state *self)
+{
+	struct io_uring_params p = {};
+	int ret;
 
 	p.flags |= IORING_SETUP_CQSIZE;
 	p.flags |= IORING_SETUP_COOP_TASKRUN;
@@ -703,25 +725,118 @@ void NORETURN pworker_main(int fd, struct iou_opts *opts)
 	p.flags |= IORING_SETUP_R_DISABLED;
 
 	p.cq_entries = 8192;
-	ret = io_uring_queue_init_params(64, &ring, &p);
+	ret = io_uring_queue_init_params(64, &self->ring, &p);
 	if (ret < 0)
-		err(2, "Failed to init io_uring");
-	self.ring = &ring;
+		err(5, "Failed to create io_uring");
+
+	io_uring_enable_rings(&self->ring);
 
 	// TODO: permutations of options
 	// provided buffers
 	// fixed files
 	// zero copy rx
+	
+	return 0;
+}
 
-	ev.events = EPOLLIN;
-	ev.data.fd = fd;
-	if (epoll_ctl(self.epollfd, EPOLL_CTL_ADD, fd, &ev) < 0)
-		err(6, "Failed to init epoll");
-	io_uring_enable_rings(&ring);
+static void
+worker_iou_wait(struct worker_state *self)
+{
+	struct __kernel_timespec timeout;
+	unsigned int count = 0;
+	unsigned int head;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *cqe;
+
+	timeout.tv_sec = 1;
+	timeout.tv_nsec = 0;
+
+	io_uring_submit_and_wait_timeout(&self->ring, &cqe, 1, &timeout, NULL);
+
+	io_uring_for_each_cqe(&self->ring, head, cqe) {
+		struct connection *conn;
+		int sq_tag;
+		ssize_t n;
+		size_t chunk;
+
+		sq_tag = get_tag(cqe->user_data);
+
+		if (sq_tag != 2)
+			errx(1, "Invalid tag: %d", sq_tag);
+		conn = untag(cqe->user_data);
+
+		if (cqe->res <= 0) {
+			warn("recv error");
+			worker_kill_conn(self, conn);
+			return;
+		}
+
+		n = cqe->res;
+		void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
+		if (memcmp(conn->buf, src, n))
+			warnx("Data corruption %d %d %ld %lld %lld",
+			*conn->buf, *(char *)src, n,
+			conn->tot_recv % PATTERN_PERIOD,
+			conn->tot_recv);
+
+		conn->to_recv -= n;
+		conn->tot_recv += n;
+		if (!conn->to_recv) {
+			worker_recv_finished(self, conn);
+			if (conn->to_send)
+				errx(1, "Unexpected to_send w/ recv");
+		}
+		if (n != conn->read_size)
+			errx(1, "recv size != read_size");
+
+		memset(conn->buf, 0, conn->read_size);
+		chunk = min_t(size_t, conn->read_size, conn->to_recv);
+		sqe = io_uring_get_sqe(&self->ring);
+		io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
+		io_uring_sqe_set_data(sqe, tag(conn, 2));
+
+		count++;
+	}
+	io_uring_cq_advance(&self->ring, count);
+}
+
+static void
+worker_setup_iou_fptrs(struct worker_state *self)
+{
+	self->prep = worker_iou_prep;
+	self->wait = worker_iou_wait;
+}
+
+/* == Main loop == */
+
+void NORETURN pworker_main(int fd, struct iou_opts *opts)
+{
+	struct worker_state self = { .main_sock = fd, };
+	unsigned char j;
+	int i, ret;
+
+	list_head_init(&self.connections);
+	self.iou_opts = *opts;
+
+	if (self.iou_opts.enable)
+		worker_setup_iou_fptrs(&self);
+	else
+		worker_setup_fptrs(&self);
+
+	/* Initialize the data buffer we send/receive, it must match
+	 * on both ends, this is how we catch data corruption (ekhm kTLS..)
+	 */
+	for (i = 0, j = 0; i < (int)ARRAY_SIZE(patbuf); i++, j++) {
+		j = j ?: 1;
+		patbuf[i] = j;
+	}
+
+	ret = self.prep(&self);
+	if (ret)
+		err(ret, "Worker failed prep()");
+
 
 	while (!self.quit) {
-		struct io_uring_sqe *sqe;
-		struct io_uring_cqe *cqe;
 		int msec = -1;
 
 		/* Check if we should end the test if we initiated */
@@ -734,78 +849,11 @@ void NORETURN pworker_main(int fd, struct iou_opts *opts)
 				worker_report_test(&self);
 		}
 
-		struct __kernel_timespec timeout;
-		timeout.tv_sec = 1;
-		timeout.tv_nsec = 0;
-		if (self.iou) {
-			unsigned int count = 0;
-			unsigned int head;
-
-			ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 1, &timeout, NULL);
-			io_uring_for_each_cqe(&ring, head, cqe) {
-				struct connection *conn;
-				int sq_tag;
-				ssize_t n;
-				size_t chunk;
-
-				sq_tag = get_tag(cqe->user_data);
-				if (sq_tag != 2)
-					errx(1, "Invalid tag: %d", sq_tag);
-				conn = untag(cqe->user_data);
-
-				if (cqe->res <= 0) {
-					warn("recv error");
-					worker_kill_conn(&self, conn);
-					goto err;
-				}
-
-				n = cqe->res;
-				void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
-				if (memcmp(conn->buf, src, n))
-					warnx("Data corruption %d %d %ld %lld %lld",
-					*conn->buf, *(char *)src, n,
-					conn->tot_recv % PATTERN_PERIOD,
-					conn->tot_recv);
-
-				conn->to_recv -= n;
-				conn->tot_recv += n;
-				if (!conn->to_recv) {
-					worker_recv_finished(&self, conn);
-					if (conn->to_send)
-						errx(1, "Unexpected to_send w/ recv");
-				}
-				if (n != conn->read_size)
-					errx(1, "recv size != read_size");
-
-				memset(conn->buf, 0, conn->read_size);
-				chunk = min_t(size_t, conn->read_size, conn->to_recv);
-				sqe = io_uring_get_sqe(&ring);
-				io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
-				io_uring_sqe_set_data(sqe, tag(conn, 2));
-
-				count++;
-			}
-			io_uring_cq_advance(&ring, count);
-		}
-
-		nfds = epoll_wait(self.epollfd, events, ARRAY_SIZE(events),
-				  1);
-		if (nfds < 0)
-			err(7, "Failed to epoll");
-
-		for (i = 0; i < nfds; i++) {
-			struct epoll_event *e = &events[i];
-
-			if (e->data.fd == self.main_sock)
-				worker_handle_main_sock(&self);
-			else
-				worker_handle_conn(&self, e->data.fd,
-						   e->events);
-		}
+		self.wait(&self);
 	}
 
-err:
 	kpm_info("exiting!");
-	io_uring_queue_exit(&ring);
+	if (self.iou_opts.enable)
+		io_uring_queue_exit(&self.ring);
 	exit(0);
 }

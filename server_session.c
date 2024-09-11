@@ -58,8 +58,6 @@ struct pworker {
 	pid_t pid;
 	int busy;
 	struct list_node pworkers;
-	// TODO: configuration?
-	void (*main)(void);
 };
 
 struct test {

@@ -40,6 +40,10 @@ enum kpm_msg_type {
 	KPM_MSG_REPLY		= 0x8000
 };
 
+enum kpm_iou_req_type {
+	KPM_IOU_REQ_TYPE_MAIN = 1,
+};
+
 struct kpm_header {
 	__u16 type;
 	__u16 id;
