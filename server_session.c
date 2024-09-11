@@ -39,6 +39,7 @@ struct session_state {
 	struct list_head connections;
 	struct list_head pworkers;
 	struct list_head tests;
+	struct io_uring *ring;
 };
 
 struct connection {
@@ -118,6 +119,9 @@ static void session_new_conn(struct session_state *self, int fd)
 
 	conn->id = ++self->connection_ids;
 	conn->fd = fd;
+	// NOTE: only receiver
+	// the sender server opens this connection
+	printf("----- session_new_conn: fd=%d\n", fd);
 
 	len = sizeof(conn->cpu);
 	if (getsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &conn->cpu, &len) < 0) {
@@ -509,6 +513,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	}
 	memset(pwrk, 0, sizeof(*pwrk));
 
+	// NOTE: writing to p[0] will be read out of p[1]
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, p) < 0)
 		goto err_free;
 
@@ -518,11 +523,13 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 		goto err_free;
 	}
 	if (!pwrk->pid) {
+		// NOTE: child
 		close(p[0]);
 		pworker_main(p[1]);
 		exit(1);
 	}
 
+	// NOTE: parent
 	pwrk->id = ++self->worker_ids;
 	pwrk->fd = p[0];
 	close(p[1]);
@@ -624,6 +631,7 @@ bad_req:
 	n_conns /= sizeof(struct kpm_test_spec);
 	if (req->test_id || !req->time_sec || n_conns != req->n_conns)
 		goto bad_req;
+	printf("----- server_msg_test: n_conns=%u\n", n_conns);
 
 	test = malloc(sizeof(*test));
 	memset(test, 0, sizeof(*test));
@@ -761,6 +769,7 @@ static void session_handle_main_sock(struct session_state *self)
 {
 	struct kpm_header *hdr;
 
+	printf("session_handle_main_sock\n");
 	hdr = kpm_receive(self->main_sock);
 	if (!hdr) {
 		__kpm_dbg("<<", "ctrl recv failed");
@@ -883,6 +892,7 @@ static void session_handle_worker(struct session_state *self, int fd)
 {
 	struct kpm_header *hdr;
 
+	printf("session_handle_worker\n");
 	hdr = kpm_receive(fd);
 	if (!hdr) {
 		warnx("worker recv empty");
@@ -911,6 +921,7 @@ static void session_handle_accept_sock(struct session_state *self)
 	socklen_t addrlen;
 	int cfd;
 
+	printf("session_handle_accept_sock\n");
 	__kpm_trace(">>", "accept");
 
 	addrlen = sizeof(sockaddr);
@@ -998,6 +1009,7 @@ server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen)
 	if (ses->pid)
 		return ses;
 
+	// NOTE: child
 	free(ses);
 	server_session(fd);
 }

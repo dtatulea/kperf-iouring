@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <liburing.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,6 +21,8 @@
 
 #include "server.h"
 
+#define QD	64
+
 int verbose;
 
 static struct {
@@ -27,8 +30,10 @@ static struct {
 	char *pid_file;
 	bool kill;
 	bool server;
+	bool iou;
 } opt = {
 	.server		= true,
+	.iou		= false,
 	.service	= "18323",
 	.pid_file	= "/tmp/kperf.pid",
 };
@@ -45,6 +50,7 @@ static const struct opt_table opts[] = {
 			"Verbose mode (can be specified more than once)"),
  	OPT_WITHOUT_ARG("--usage|--help|-h", opt_usage_and_exit,
  			"kpeft server",	"Show this help message"),
+	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.iou, "Use io_uring"),
  	OPT_ENDTABLE
 };
 
@@ -171,12 +177,14 @@ int main(int argc, char *argv[])
 	if (!addr)
 		errx(1, "Failed to look up service to bind to");
 
+	// NOTE: up to two, one for ipv6 and one for ipv4
 	num_fds = net_bind(addr, fds);
 	freeaddrinfo(addr);
 	if (num_fds < 1)
 		err(1, "Failed to listen");
 
 	max_fd = num_fds == 1 || fds[0] > fds[1] ? fds[0] : fds[1];
+	printf("max_fd=%d\n", max_fd);
 
 	signal(SIGCHLD, chld_sig_handler);
 
@@ -195,6 +203,7 @@ int main(int argc, char *argv[])
 		tv.tv_sec = 1;
 		tv.tv_usec = 0;
 
+		// NOTE: listening for new client connections
 		ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
 		if (ret < 0) {
 			if (errno == EINTR && chld)
@@ -219,6 +228,7 @@ int main(int argc, char *argv[])
 		}
 
 		ses = server_session_spawn(cfd, &sockaddr, &addrlen);
+		// NOTE: parent
 		if (ses)
 			server_session_add(ses);
 reap_child:
