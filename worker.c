@@ -25,6 +25,8 @@
 #include "server.h"
 #include "tcp.h"
 
+struct connection;
+
 /* Main worker state AKA self */
 struct worker_state {
 	int main_sock;
@@ -37,12 +39,12 @@ struct worker_state {
 	struct timemono prev_loop;
 	unsigned int test_len_msec;
 
-	bool iou;
 	struct iou_opts iou_opts;
 	struct io_uring ring;
 
 	int (*prep)(struct worker_state *);
 	void (*wait)(struct worker_state *);
+	void (*add_test)(struct worker_state *, struct connection *);
 
 	struct list_head connections;
 };
@@ -69,6 +71,11 @@ struct connection {
 	};
 	unsigned char *buf;
 	struct list_node connections;
+};
+
+struct kpm_state {
+	unsigned char buf[4096];
+	size_t len;
 };
 
 #define PATTERN_PERIOD 255
@@ -263,6 +270,7 @@ worker_msg_id(struct worker_state *self, struct kpm_header *hdr)
 {
 	struct __kpm_generic_u32 *id = (void *)hdr;
 
+	printf("----- worker_msg_id\n");
 	self->id = id->val;
 }
 
@@ -278,13 +286,13 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		return;
 	}
 
+	printf("----- worker_msg_test\n");
 	kpm_info("start test %s", req->active ? "act" : "psv");
 
 	self->test = malloc(hdr->len);
 	memcpy(self->test, req, hdr->len);
 
 	for (i = 0; i < req->n_conns; i++) {
-		struct epoll_event ev = {};
 		struct connection *conn;
 		socklen_t info_len;
 		__u64 len;
@@ -336,39 +344,15 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 			return;
 		}
 
-		self->iou = false;
 		if (req->active) {
 			printf("----- worker_msg_test: to_send=%llu\n", len);
 			conn->to_send = len;
 		} else {
 			printf("----- worker_msg_test: to_recv=%llu, enabling io_uring\n", len);
 			conn->to_recv = len;
-			self->iou = true;
 		}
 
-		ev.events = EPOLLIN | EPOLLOUT;
-		ev.data.fd = conn->fd;
-		if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, conn->fd, &ev) < 0)
-			warn("Failed to modify poll out");
-
-		/* FIXME: move into iou helper
-		if (conn->to_recv) {
-			size_t chunk;
-
-			printf("----- worker_msg_test: io_uring prep recv\n");
-			conn->buf = malloc(conn->read_size);
-			chunk = min_t(size_t, conn->read_size, conn->to_recv);
-
-			sqe = io_uring_get_sqe(self->ring);
-			io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
-			io_uring_sqe_set_data(sqe, tag(conn, 2));
-		} else {
-			ev.events = EPOLLOUT;
-			ev.data.fd = conn->fd;
-			if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, conn->fd, &ev) < 0)
-				warn("Failed to modify poll out");
-		}
-		*/
+		self->add_test(self, conn);
 	}
 
 	self->cpu_start = cpu_stat_snapshot(0);
@@ -409,6 +393,7 @@ static void worker_handle_main_sock(struct worker_state *self)
 	int i;
 
 	hdr = kpm_receive(self->main_sock);
+	printf("----- got hdr success, header type=%u, id=%u, len=%u\n", hdr->type, hdr->id, hdr->len);
 	if (!hdr) {
 		__kpm_dbg("<<", "ctrl recv failed");
 		self->quit = 1;
@@ -704,17 +689,138 @@ worker_wait(struct worker_state *self)
 	}
 }
 
+static void worker_add_test(struct worker_state *self, struct connection *conn)
+{
+	struct epoll_event ev = {};
+
+	ev.events = EPOLLIN | EPOLLOUT;
+	ev.data.fd = conn->fd;
+	if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, conn->fd, &ev) < 0)
+		warn("Failed to modify poll out");
+}
+
 static void
 worker_setup_fptrs(struct worker_state *self)
 {
 	self->prep = worker_prep;
 	self->wait = worker_wait;
+	self->add_test = worker_add_test;
+}
+
+static void
+worker_iou_handle_main_sock(struct worker_state *self,
+			    struct io_uring_cqe *cqe)
+{
+	struct io_uring_sqe *sqe;
+	struct kpm_state *state;
+	size_t n;
+	int i;
+	struct kpm_header *hdr;
+
+	state = untag(cqe->user_data);
+
+	if (cqe->res <= 0)
+		errx(2, "handle main sock recv err");
+
+	if (state->len)
+		goto payload;
+
+	n = cqe->res;
+	if (n < sizeof(struct kpm_header))
+		errx(2, "handle main sock recv size too small");
+	hdr = (struct kpm_header *)state->buf;
+
+	if (hdr->len < sizeof(struct kpm_header))
+		errx(2, "handle main sock invalid header len");
+	state->len = n;
+	printf("----- got hdr success, n=%lu, header type=%u, id=%u, len=%u\n", n, hdr->type, hdr->id, hdr->len);
+
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_recv(sqe, self->main_sock, state->buf + n, (hdr->len - n), 0);
+	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
+	return;
+
+payload:
+	n = cqe->res;
+	hdr = (struct kpm_header *)state->buf;
+	if (state->len + n < hdr->len)
+		errx(2, "not got full frame");
+
+	for (i = 0; i < (int)ARRAY_SIZE(msg_handlers); i++) {
+		if (msg_handlers[i].type != hdr->type) {
+			printf("----- handler type did not match state header type: %d\n", hdr->type);
+			continue;
+		}
+
+		if (hdr->len < msg_handlers[i].req_size) {
+			warn("Invalid request for %s", msg_handlers[i].name);
+			self->quit = 1;
+			break;
+		}
+
+		msg_handlers[i].cb(self, hdr);
+		break;
+	}
+	if (i == (int)ARRAY_SIZE(msg_handlers)) {
+		warnx("Unknown message type: %d", hdr->type);
+		self->quit = 1;
+	}
+
+	memset(state, 0, sizeof(*state));
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_recv(sqe, self->main_sock, state->buf, sizeof(struct kpm_header), 0);
+	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
+
+	//free(state);
+}
+
+static void worker_iou_handle_conn(struct worker_state *self, struct io_uring_cqe *cqe)
+{
+	struct io_uring_sqe *sqe;
+	struct connection *conn;
+	ssize_t n;
+	size_t chunk;
+
+	conn = untag(cqe->user_data);
+
+	if (cqe->res <= 0) {
+		warn("recv error");
+		worker_kill_conn(self, conn);
+		return;
+	}
+
+	n = cqe->res;
+	void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
+	if (memcmp(conn->buf, src, n))
+		warnx("Data corruption %d %d %ld %lld %lld",
+		*conn->buf, *(char *)src, n,
+		conn->tot_recv % PATTERN_PERIOD,
+		conn->tot_recv);
+
+	conn->to_recv -= n;
+	conn->tot_recv += n;
+	if (!conn->to_recv) {
+		worker_recv_finished(self, conn);
+		if (conn->to_send)
+			errx(1, "Unexpected to_send w/ recv");
+	}
+	/*
+	if (n != conn->read_size)
+		errx(1, "recv size %lu != read_size %u", n, conn->read_size);
+	*/
+
+	chunk = min_t(size_t, conn->read_size, conn->to_recv);
+	memset(conn->buf, 0, conn->read_size);
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
 }
 
 static int
 worker_iou_prep(struct worker_state *self)
 {
 	struct io_uring_params p = {};
+	struct io_uring_sqe *sqe;
 	int ret;
 
 	p.flags |= IORING_SETUP_CQSIZE;
@@ -729,12 +835,20 @@ worker_iou_prep(struct worker_state *self)
 	if (ret < 0)
 		err(5, "Failed to create io_uring");
 
-	io_uring_enable_rings(&self->ring);
+	struct kpm_state *state;
+	state = malloc(sizeof(*state));
+	memset(state, 0, sizeof(*state));
+
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_recv(sqe, self->main_sock, state->buf, sizeof(struct kpm_header), 0);
+	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
 
 	// TODO: permutations of options
 	// provided buffers
 	// fixed files
 	// zero copy rx
+
+	io_uring_enable_rings(&self->ring);
 	
 	return 0;
 }
@@ -745,7 +859,6 @@ worker_iou_wait(struct worker_state *self)
 	struct __kernel_timespec timeout;
 	unsigned int count = 0;
 	unsigned int head;
-	struct io_uring_sqe *sqe;
 	struct io_uring_cqe *cqe;
 
 	timeout.tv_sec = 1;
@@ -754,46 +867,13 @@ worker_iou_wait(struct worker_state *self)
 	io_uring_submit_and_wait_timeout(&self->ring, &cqe, 1, &timeout, NULL);
 
 	io_uring_for_each_cqe(&self->ring, head, cqe) {
-		struct connection *conn;
 		int sq_tag;
-		ssize_t n;
-		size_t chunk;
 
 		sq_tag = get_tag(cqe->user_data);
-
-		if (sq_tag != 2)
-			errx(1, "Invalid tag: %d", sq_tag);
-		conn = untag(cqe->user_data);
-
-		if (cqe->res <= 0) {
-			warn("recv error");
-			worker_kill_conn(self, conn);
-			return;
-		}
-
-		n = cqe->res;
-		void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
-		if (memcmp(conn->buf, src, n))
-			warnx("Data corruption %d %d %ld %lld %lld",
-			*conn->buf, *(char *)src, n,
-			conn->tot_recv % PATTERN_PERIOD,
-			conn->tot_recv);
-
-		conn->to_recv -= n;
-		conn->tot_recv += n;
-		if (!conn->to_recv) {
-			worker_recv_finished(self, conn);
-			if (conn->to_send)
-				errx(1, "Unexpected to_send w/ recv");
-		}
-		if (n != conn->read_size)
-			errx(1, "recv size != read_size");
-
-		memset(conn->buf, 0, conn->read_size);
-		chunk = min_t(size_t, conn->read_size, conn->to_recv);
-		sqe = io_uring_get_sqe(&self->ring);
-		io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
-		io_uring_sqe_set_data(sqe, tag(conn, 2));
+		if (sq_tag == KPM_IOU_REQ_TYPE_MAIN)
+			worker_iou_handle_main_sock(self, cqe);
+		else if (sq_tag == KPM_IOU_REQ_TYPE_READ)
+			worker_iou_handle_conn(self, cqe);
 
 		count++;
 	}
@@ -801,10 +881,30 @@ worker_iou_wait(struct worker_state *self)
 }
 
 static void
+worker_iou_add_test(struct worker_state *self, struct connection *conn)
+{
+	struct io_uring_sqe *sqe;
+
+	if (conn->to_send)
+		errx(1, "io_uring doesn't support send yet");
+
+	size_t chunk;
+
+	chunk = min_t(size_t, conn->read_size, conn->to_recv);
+	conn->buf = malloc(conn->read_size);
+	printf("----- worker_iou_add_test: io_uring prep recv, read_size=%u, chunk=%lu\n", conn->read_size, chunk);
+
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
+}
+
+static void
 worker_setup_iou_fptrs(struct worker_state *self)
 {
 	self->prep = worker_iou_prep;
 	self->wait = worker_iou_wait;
+	self->add_test = worker_iou_add_test;
 }
 
 /* == Main loop == */
@@ -834,7 +934,6 @@ void NORETURN pworker_main(int fd, struct iou_opts *opts)
 	ret = self.prep(&self);
 	if (ret)
 		err(ret, "Worker failed prep()");
-
 
 	while (!self.quit) {
 		int msec = -1;

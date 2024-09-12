@@ -42,6 +42,7 @@ enum kpm_msg_type {
 
 enum kpm_iou_req_type {
 	KPM_IOU_REQ_TYPE_MAIN = 1,
+	KPM_IOU_REQ_TYPE_READ = 2,
 };
 
 struct kpm_header {
