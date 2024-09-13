@@ -716,26 +716,11 @@ worker_setup_fptrs(struct worker_state *self)
 	self->stop_test = worker_stop_test;
 }
 
-static void
-worker_iou_handle_main_sock(struct worker_state *self,
-			    struct io_uring_cqe *cqe)
+static void worker_iou_handle_proto_hdr(struct worker_state *self, struct kpm_state *state, struct io_uring_cqe *cqe)
 {
 	struct io_uring_sqe *sqe;
-	struct kpm_state *state;
-	size_t n;
-	int i;
 	struct kpm_header *hdr;
-
-	state = untag(cqe->user_data);
-
-	if (cqe->res < 0)
-		errx(2, "handle main sock recv err: %d", cqe->res);
-	// EOF
-	if (cqe->res == 0)
-		return;
-
-	if (state->len)
-		goto payload;
+	size_t n;
 
 	n = cqe->res;
 	if (n < sizeof(struct kpm_header))
@@ -749,9 +734,15 @@ worker_iou_handle_main_sock(struct worker_state *self,
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_recv(sqe, self->main_sock, state->buf + n, (hdr->len - n), 0);
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
-	return;
+}
 
-payload:
+static void worker_iou_handle_proto(struct worker_state *self, struct kpm_state *state, struct io_uring_cqe *cqe)
+{
+	struct io_uring_sqe *sqe;
+	struct kpm_header *hdr;
+	size_t n;
+	int i;
+
 	n = cqe->res;
 	hdr = (struct kpm_header *)state->buf;
 	if (state->len + n < hdr->len)
@@ -775,10 +766,34 @@ payload:
 		self->quit = 1;
 	}
 
+	if (hdr->type == KPM_MSG_WORKER_END_TEST) {
+		self->quit = 1;
+		return;
+	}
+	
 	memset(state, 0, sizeof(*state));
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_recv(sqe, self->main_sock, state->buf, sizeof(struct kpm_header), 0);
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
+}
+
+static void
+worker_iou_handle_main_sock(struct worker_state *self,
+			    struct io_uring_cqe *cqe)
+{
+	struct kpm_state *state;
+
+	if (cqe->res < 0)
+		errx(2, "handle main sock recv err: %d", cqe->res);
+	// EOF
+	if (cqe->res == 0)
+		return;
+
+	state = untag(cqe->user_data);
+	if (!state->len)
+		worker_iou_handle_proto_hdr(self, state, cqe);
+	else
+		worker_iou_handle_proto(self, state, cqe);
 }
 
 static void worker_iou_handle_read(struct worker_state *self, struct io_uring_cqe *cqe)
@@ -942,15 +957,51 @@ static int worker_iou_zcrx_register(struct iou_zcrx *zcrx, struct iou_opts *opts
 	return 0;
 }
 
+static int worker_iou_prep_recvzc(struct worker_state *self, struct iou_opts *opts)
+{
+	struct iou_zcrx *zcrx = &self->iou_zcrx;
+	unsigned int ifindex;
+	void *area;
+	int ret;
+
+	zcrx->ring = &self->ring;
+
+	// TODO: hard coded for now
+	ifindex = if_nametoindex("eth0");
+	if (!ifindex) {
+		err(5, "Bad interface name: eth0");
+		return 1;
+	}
+	zcrx->ifindex = ifindex;
+
+	zcrx->area_size = opts->zcrx_pages * opts->zcrx_page_size;
+	area = mmap(NULL,
+		    zcrx->area_size,
+		    PROT_READ | PROT_WRITE,
+		    MAP_ANONYMOUS | MAP_PRIVATE,
+		    0,
+		    0);
+	if (area == MAP_FAILED) {
+		err(5, "Failed to mmap zero copy area");
+		return 1;
+	}
+	zcrx->area_base = area;
+
+	ret = worker_iou_zcrx_register(zcrx, opts);
+	if (ret) {
+		err(5, "Failed to register zcrx");
+		return ret;
+	}
+
+	return 0;
+}
+
 static int
 worker_iou_prep(struct worker_state *self)
 {
 	struct iou_opts *opts = &self->iou_opts;
-	struct iou_zcrx *zcrx = &self->iou_zcrx;
 	struct io_uring_params p = {};
 	struct io_uring_sqe *sqe;
-	unsigned int ifindex;
-	void *area;
 	int ret;
 
 	p.flags |= IORING_SETUP_CQSIZE;
@@ -961,33 +1012,13 @@ worker_iou_prep(struct worker_state *self)
 	p.flags |= IORING_SETUP_R_DISABLED;
 	p.flags |= IORING_SETUP_CQE32;
 
-	printf("----- iou prep\n");
 	p.cq_entries = 8192;
 	ret = io_uring_queue_init_params(64, &self->ring, &p);
 	if (ret < 0)
 		err(5, "Failed to create io_uring");
-	zcrx->ring = &self->ring;
 
-	// TODO: hard coded for now
-	ifindex = if_nametoindex("eth0");
-	if (!ifindex)
-		err(5, "Bad interface name: eth0");
-	zcrx->ifindex = ifindex;
-
-	zcrx->area_size = opts->zcrx_pages * opts->zcrx_page_size;
-	area = mmap(NULL,
-		    zcrx->area_size,
-		    PROT_READ | PROT_WRITE,
-		    MAP_ANONYMOUS | MAP_PRIVATE,
-		    0,
-		    0);
-	if (area == MAP_FAILED)
-		err(5, "Failed to mmap zero copy area");
-	zcrx->area_base = area;
-
-	ret = worker_iou_zcrx_register(zcrx, opts);
-	if (ret)
-		err(5, "Failed to register zcrx");
+	if (opts->zcrx)
+		ret = worker_iou_prep_recvzc(self, opts);
 
 	struct kpm_state *state;
 	state = malloc(sizeof(*state));
@@ -1082,9 +1113,10 @@ worker_iou_stop_test(struct worker_state *self, struct connection *conn)
 	struct io_uring_sqe *sqe;
 
 	printf("----- iou stop_test\n");
-	// TODO: fix this to clean up everything incl the ifq
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_cancel(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ), 0);
+	io_uring_prep_cancel_fd(sqe, conn->fd, 0);
+	// FIXME: called from worker_kill_conn() which may not be ending test but only killing a conn
+	// need to submit the cancel fd req!
 }
 
 static void
@@ -1141,8 +1173,7 @@ void NORETURN pworker_main(int fd, struct iou_opts *opts)
 	}
 
 	kpm_info("exiting!");
-	printf("----- pworker_main exit\n");
-	// FIXME:
+	// FIXME:io_uring not exiting properly
 	if (self.iou_opts.enable)
 		io_uring_queue_exit(&self.ring);
 	exit(0);

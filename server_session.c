@@ -525,7 +525,6 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		// NOTE: child
 		close(p[0]);
-		printf("----- spawning new worker\n");
 		pworker_main(p[1], &self->iou_opts);
 		exit(1);
 	}
