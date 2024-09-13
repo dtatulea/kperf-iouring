@@ -301,6 +301,8 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		struct connection *conn;
 		socklen_t info_len;
 		__u64 len;
+		struct sockaddr_in6 addr;
+		socklen_t sock_len = sizeof(addr);
 
 		conn = malloc(sizeof(*conn));
 		memset(conn, 0, sizeof(*conn));
@@ -308,6 +310,8 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		conn->id = req->specs[i].connection_id;
 		// NOTE: this connection was already opened from remote server
 		conn->fd = fdpass_recv(self->main_sock);
+		getsockname(conn->fd, (struct sockaddr *)&addr, &sock_len);
+		printf("----- conn->fd port: %d\n", ntohs(addr.sin6_port));
 
 		info_len = sizeof(conn->init_info);
 		if (getsockopt(conn->fd, IPPROTO_TCP, TCP_INFO,
@@ -860,6 +864,28 @@ static void iou_zcrx_recycle(struct iou_zcrx *zcrx, struct io_uring_cqe *cqe, st
 	IO_URING_WRITE_ONCE(*zcrx->rq_ring.ktail, zcrx->rq_ring.rq_tail);
 }
 
+static void worker_iou_add_recvzc(struct io_uring *ring, struct connection *conn)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(ring);
+	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, conn->fd, NULL, 0, 0);
+	sqe->ioprio |= IORING_RECV_MULTISHOT;
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_RECVZC));
+}
+
+static void worker_iou_add_recv(struct io_uring *ring, struct connection *conn)
+{
+	struct io_uring_sqe *sqe;
+	size_t chunk;
+
+	chunk = min_t(size_t, conn->read_size, conn->to_recv);
+	conn->buf = malloc(chunk);
+	sqe = io_uring_get_sqe(ring);
+	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
+}
+
 static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_cqe *cqe)
 {
 	struct connection *conn;
@@ -886,7 +912,7 @@ static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_
 	}
 
 	if (!(cqe->flags & IORING_CQE_F_MORE))
-		worker_add_test(self, conn);
+		worker_iou_add_recvzc(&self->ring, conn);
 
 	rcqe = (struct io_uring_zcrx_cqe*)(cqe + 1);
 
@@ -924,6 +950,7 @@ static int worker_iou_zcrx_register(struct iou_zcrx *zcrx, struct iou_opts *opts
 		.area_id = 0,
 	};
 
+	printf("----- zcrx_register: queue id=%ld\n", opts->zcrx_queue_id);
 	struct io_uring_zcrx_ifq_reg reg = {
 		.if_idx = zcrx->ifindex,
 		.if_rxq = opts->zcrx_queue_id,
@@ -1068,28 +1095,6 @@ worker_iou_wait(struct worker_state *self)
 		count++;
 	}
 	io_uring_cq_advance(&self->ring, count);
-}
-
-static void worker_iou_add_recvzc(struct io_uring *ring, struct connection *conn)
-{
-	struct io_uring_sqe *sqe;
-
-	sqe = io_uring_get_sqe(ring);
-	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, conn->fd, NULL, 0, 0);
-	sqe->ioprio |= IORING_RECV_MULTISHOT;
-	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_RECVZC));
-}
-
-static void worker_iou_add_recv(struct io_uring *ring, struct connection *conn)
-{
-	struct io_uring_sqe *sqe;
-	size_t chunk;
-
-	chunk = min_t(size_t, conn->read_size, conn->to_recv);
-	conn->buf = malloc(chunk);
-	sqe = io_uring_get_sqe(ring);
-	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
-	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
 }
 
 static void

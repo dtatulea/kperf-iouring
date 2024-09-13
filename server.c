@@ -30,17 +30,20 @@ static struct {
 	char *pid_file;
 	bool kill;
 	bool server;
-	struct iou_opts iou_opts;
+	struct server_opts server_opts;
 } opt = {
 	.server		= true,
 	.service	= "18323",
 	.pid_file	= "/tmp/kperf.pid",
-	.iou_opts	= {
-		.enable		= false,
-		.zcrx		= false,
-		.zcrx_pages	= 4096,
-		.zcrx_page_size	= 4096,
-		.zcrx_queue_id	= 0,
+	.server_opts	= {
+		.accept_port	= 0,
+		.iou_opts	= {
+			.enable		= false,
+			.zcrx		= false,
+			.zcrx_pages	= 4096,
+			.zcrx_page_size	= 4096,
+			.zcrx_queue_id	= 0,
+		},
 	},
 };
 
@@ -56,11 +59,12 @@ static const struct opt_table opts[] = {
 			"Verbose mode (can be specified more than once)"),
  	OPT_WITHOUT_ARG("--usage|--help|-h", opt_usage_and_exit,
  			"kpeft server",	"Show this help message"),
-	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.iou_opts.enable, "Use io_uring"),
-	OPT_WITHOUT_ARG("--iou_zcrx", opt_set_bool, &opt.iou_opts.zcrx, "io_uring: Use zero copy Rx"),
-	OPT_WITH_ARG("--iou_pages", opt_set_ulongval, opt_show_ulongval, &opt.iou_opts.zcrx_pages, "io_uring"),
-	OPT_WITH_ARG("--iou_page_size", opt_set_ulongval, opt_show_ulongval, &opt.iou_opts.zcrx_page_size, "io_uring"),
-	OPT_WITH_ARG("--iou_queue_id", opt_set_ulongval, opt_show_ulongval, &opt.iou_opts.zcrx_queue_id, "io_uring"),
+	OPT_WITH_ARG("--accept_port", opt_set_uintval, opt_show_uintval, &opt.server_opts.accept_port, "Accept port"),
+	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.server_opts.iou_opts.enable, "Use io_uring"),
+	OPT_WITHOUT_ARG("--iou_zcrx", opt_set_bool, &opt.server_opts.iou_opts.zcrx, "io_uring: Use zero copy Rx"),
+	OPT_WITH_ARG("--iou_pages", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_pages, "io_uring"),
+	OPT_WITH_ARG("--iou_page_size", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_page_size, "io_uring"),
+	OPT_WITH_ARG("--iou_queue_id", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_queue_id, "io_uring"),
  	OPT_ENDTABLE
 };
 
@@ -236,7 +240,7 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
-		ses = server_session_spawn(cfd, &sockaddr, &addrlen, &opt.iou_opts);
+		ses = server_session_spawn(cfd, &sockaddr, &addrlen, &opt.server_opts);
 		// NOTE: parent
 		if (ses)
 			server_session_add(ses);

@@ -36,7 +36,8 @@ struct session_state {
 	unsigned int connection_ids;
 	unsigned int worker_ids;
 	unsigned int test_ids;
-	struct iou_opts iou_opts;
+	unsigned int accept_port;
+	struct server_opts opts;
 
 	struct list_head connections;
 	struct list_head pworkers;
@@ -161,7 +162,8 @@ server_msg_tcp_acceptor(struct session_state *self, struct kpm_header *req)
 		self->quit = 1;
 		return;
 	}
-	addr.sin6_port = 0;
+	printf("----- tcp acceptor port=%u\n", self->opts.accept_port);
+	addr.sin6_port = htons(self->opts.accept_port);
 
 	self->tcp_sock = socket(addr.sin6_family, SOCK_STREAM, 0);
 	if (self->tcp_sock < 0) {
@@ -525,7 +527,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		// NOTE: child
 		close(p[0]);
-		pworker_main(p[1], &self->iou_opts);
+		pworker_main(p[1], &self->opts.iou_opts);
 		exit(1);
 	}
 
@@ -929,7 +931,7 @@ static void session_handle_accept_sock(struct session_state *self)
 		session_new_conn(self, cfd);
 }
 
-static void server_session_loop(int fd, struct iou_opts *opts)
+static void server_session_loop(int fd, struct server_opts *opts)
 {
 	struct session_state self = { .main_sock = fd, };
 	struct epoll_event ev = {}, events[32];
@@ -939,9 +941,7 @@ static void server_session_loop(int fd, struct iou_opts *opts)
 	list_head_init(&self.pworkers);
 	list_head_init(&self.tests);
 
-	if (opts)
-		self.iou_opts = *opts;
-
+	self.opts = *opts;
 	self.epollfd = epoll_create1(0);
 	if (self.epollfd < 0)
 		err(1, "Failed to create epoll");
@@ -979,7 +979,7 @@ static void server_session_loop(int fd, struct iou_opts *opts)
 	}
 }
 
-static NORETURN void server_session(int fd, struct iou_opts *opts)
+static NORETURN void server_session(int fd, struct server_opts *opts)
 {
 	if (!kpm_xchg_hello(fd, NULL))
 		server_session_loop(fd, opts);
@@ -989,7 +989,7 @@ static NORETURN void server_session(int fd, struct iou_opts *opts)
 
 struct server_session *
 server_session_spawn(int fd, struct sockaddr_in6 *addr,
-		     socklen_t *addrlen, struct iou_opts *opts)
+		     socklen_t *addrlen, struct server_opts *opts)
 {
 	struct server_session *ses;
 
