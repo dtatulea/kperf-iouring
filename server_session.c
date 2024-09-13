@@ -122,7 +122,6 @@ static void session_new_conn(struct session_state *self, int fd)
 	conn->fd = fd;
 	// NOTE: only receiver
 	// the sender server opens this connection
-	printf("----- session_new_conn: fd=%d\n", fd);
 
 	len = sizeof(conn->cpu);
 	if (getsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &conn->cpu, &len) < 0) {
@@ -632,7 +631,6 @@ bad_req:
 	n_conns /= sizeof(struct kpm_test_spec);
 	if (req->test_id || !req->time_sec || n_conns != req->n_conns)
 		goto bad_req;
-	printf("----- server_msg_test: n_conns=%u\n", n_conns);
 
 	test = malloc(sizeof(*test));
 	memset(test, 0, sizeof(*test));

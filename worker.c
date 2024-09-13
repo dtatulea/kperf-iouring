@@ -45,6 +45,7 @@ struct worker_state {
 	int (*prep)(struct worker_state *);
 	void (*wait)(struct worker_state *);
 	void (*add_test)(struct worker_state *, struct connection *);
+	void (*stop_test)(struct worker_state *, struct connection *);
 
 	struct list_head connections;
 };
@@ -97,13 +98,7 @@ worker_find_connection_by_fd(struct worker_state *self, int fd)
 static void
 worker_kill_conn(struct worker_state *self, struct connection *conn)
 {
-	/*
-	struct epoll_event ev = {};
-
-	ev.data.fd = conn->fd;
-	if (epoll_ctl(self->epollfd, EPOLL_CTL_DEL, conn->fd, &ev) < 0)
-		warn("Failed to del poll out");
-	*/
+	self->stop_test(self, conn);
 	close(conn->fd);
 	list_del(&conn->connections);
 	free(conn->rr.log);
@@ -270,7 +265,6 @@ worker_msg_id(struct worker_state *self, struct kpm_header *hdr)
 {
 	struct __kpm_generic_u32 *id = (void *)hdr;
 
-	printf("----- worker_msg_id\n");
 	self->id = id->val;
 }
 
@@ -286,7 +280,6 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		return;
 	}
 
-	printf("----- worker_msg_test\n");
 	kpm_info("start test %s", req->active ? "act" : "psv");
 
 	self->test = malloc(hdr->len);
@@ -344,13 +337,10 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 			return;
 		}
 
-		if (req->active) {
-			printf("----- worker_msg_test: to_send=%llu\n", len);
+		if (req->active)
 			conn->to_send = len;
-		} else {
-			printf("----- worker_msg_test: to_recv=%llu, enabling io_uring\n", len);
+		else
 			conn->to_recv = len;
-		}
 
 		self->add_test(self, conn);
 	}
@@ -393,7 +383,6 @@ static void worker_handle_main_sock(struct worker_state *self)
 	int i;
 
 	hdr = kpm_receive(self->main_sock);
-	printf("----- got hdr success, header type=%u, id=%u, len=%u\n", hdr->type, hdr->id, hdr->len);
 	if (!hdr) {
 		__kpm_dbg("<<", "ctrl recv failed");
 		self->quit = 1;
@@ -652,8 +641,7 @@ worker_handle_conn(struct worker_state *self, int fd, unsigned int events)
 		warnx("Connection has nothing to do %x", events);
 }
 
-static int
-worker_prep(struct worker_state *self)
+static int worker_prep(struct worker_state *self)
 {
 	struct epoll_event ev;
 
@@ -669,8 +657,7 @@ worker_prep(struct worker_state *self)
 	return 0;
 }
 
-static void
-worker_wait(struct worker_state *self)
+static void worker_wait(struct worker_state *self)
 {
 	struct epoll_event events[32];
 	int i, nfds;
@@ -699,12 +686,22 @@ static void worker_add_test(struct worker_state *self, struct connection *conn)
 		warn("Failed to modify poll out");
 }
 
+static void worker_stop_test(struct worker_state *self, struct connection *conn)
+{
+	struct epoll_event ev = {};
+
+	ev.data.fd = conn->fd;
+	if (epoll_ctl(self->epollfd, EPOLL_CTL_DEL, conn->fd, &ev) < 0)
+		warn("Failed to del poll out");
+}
+
 static void
 worker_setup_fptrs(struct worker_state *self)
 {
 	self->prep = worker_prep;
 	self->wait = worker_wait;
 	self->add_test = worker_add_test;
+	self->stop_test = worker_stop_test;
 }
 
 static void
@@ -719,8 +716,11 @@ worker_iou_handle_main_sock(struct worker_state *self,
 
 	state = untag(cqe->user_data);
 
-	if (cqe->res <= 0)
-		errx(2, "handle main sock recv err");
+	if (cqe->res < 0)
+		errx(2, "handle main sock recv err: %d", cqe->res);
+	// EOF
+	if (cqe->res == 0)
+		return;
 
 	if (state->len)
 		goto payload;
@@ -733,7 +733,6 @@ worker_iou_handle_main_sock(struct worker_state *self,
 	if (hdr->len < sizeof(struct kpm_header))
 		errx(2, "handle main sock invalid header len");
 	state->len = n;
-	printf("----- got hdr success, n=%lu, header type=%u, id=%u, len=%u\n", n, hdr->type, hdr->id, hdr->len);
 
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_recv(sqe, self->main_sock, state->buf + n, (hdr->len - n), 0);
@@ -747,10 +746,8 @@ payload:
 		errx(2, "not got full frame");
 
 	for (i = 0; i < (int)ARRAY_SIZE(msg_handlers); i++) {
-		if (msg_handlers[i].type != hdr->type) {
-			printf("----- handler type did not match state header type: %d\n", hdr->type);
+		if (msg_handlers[i].type != hdr->type)
 			continue;
-		}
 
 		if (hdr->len < msg_handlers[i].req_size) {
 			warn("Invalid request for %s", msg_handlers[i].name);
@@ -770,8 +767,6 @@ payload:
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_recv(sqe, self->main_sock, state->buf, sizeof(struct kpm_header), 0);
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
-
-	//free(state);
 }
 
 static void worker_iou_handle_conn(struct worker_state *self, struct io_uring_cqe *cqe)
@@ -781,10 +776,13 @@ static void worker_iou_handle_conn(struct worker_state *self, struct io_uring_cq
 	ssize_t n;
 	size_t chunk;
 
+	if (!self->test)
+		return;
+
 	conn = untag(cqe->user_data);
 
 	if (cqe->res <= 0) {
-		warn("recv error");
+		warn("recv error: res=%d", cqe->res);
 		worker_kill_conn(self, conn);
 		return;
 	}
@@ -892,11 +890,19 @@ worker_iou_add_test(struct worker_state *self, struct connection *conn)
 
 	chunk = min_t(size_t, conn->read_size, conn->to_recv);
 	conn->buf = malloc(conn->read_size);
-	printf("----- worker_iou_add_test: io_uring prep recv, read_size=%u, chunk=%lu\n", conn->read_size, chunk);
 
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
+}
+
+static void
+worker_iou_stop_test(struct worker_state *self, struct connection *conn)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_cancel(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ), 0);
 }
 
 static void
@@ -905,6 +911,7 @@ worker_setup_iou_fptrs(struct worker_state *self)
 	self->prep = worker_iou_prep;
 	self->wait = worker_iou_wait;
 	self->add_test = worker_iou_add_test;
+	self->stop_test = worker_iou_stop_test;
 }
 
 /* == Main loop == */
