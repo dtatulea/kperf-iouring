@@ -525,6 +525,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		// NOTE: child
 		close(p[0]);
+		printf("----- spawning new worker\n");
 		pworker_main(p[1], &self->iou_opts);
 		exit(1);
 	}
@@ -546,6 +547,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (kpm_reply_u32(self->main_sock, hdr, pwrk->id) < 1)
 		goto err_worker_kill;
 
+	// TODO: are workers not being freed?
 	list_add(&self->pworkers, &pwrk->pworkers);
 
 	return;

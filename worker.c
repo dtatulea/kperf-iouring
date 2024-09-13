@@ -781,7 +781,7 @@ payload:
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
 }
 
-static void worker_iou_handle_conn(struct worker_state *self, struct io_uring_cqe *cqe)
+static void worker_iou_handle_read(struct worker_state *self, struct io_uring_cqe *cqe)
 {
 	struct io_uring_sqe *sqe;
 	struct connection *conn;
@@ -845,12 +845,10 @@ static void iou_zcrx_recycle(struct iou_zcrx *zcrx, struct io_uring_cqe *cqe, st
 	IO_URING_WRITE_ONCE(*zcrx->rq_ring.ktail, zcrx->rq_ring.rq_tail);
 }
 
-static void worker_iou_handle_conn_recvzc(struct worker_state *self, struct io_uring_cqe *cqe)
+static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_cqe *cqe)
 {
-	struct io_uring_sqe *sqe;
 	struct connection *conn;
 	ssize_t n;
-	size_t chunk;
 	struct io_uring_zcrx_cqe* rcqe;
 	unsigned char *data;
 	struct iou_zcrx *zcrx;
@@ -963,6 +961,7 @@ worker_iou_prep(struct worker_state *self)
 	p.flags |= IORING_SETUP_R_DISABLED;
 	p.flags |= IORING_SETUP_CQE32;
 
+	printf("----- iou prep\n");
 	p.cq_entries = 8192;
 	ret = io_uring_queue_init_params(64, &self->ring, &p);
 	if (ret < 0)
@@ -1021,45 +1020,60 @@ worker_iou_wait(struct worker_state *self)
 	io_uring_submit_and_wait_timeout(&self->ring, &cqe, 1, &timeout, NULL);
 
 	io_uring_for_each_cqe(&self->ring, head, cqe) {
-		int sq_tag;
-
-		sq_tag = get_tag(cqe->user_data);
-		if (sq_tag == KPM_IOU_REQ_TYPE_MAIN)
-			worker_iou_handle_main_sock(self, cqe);
-		else if (sq_tag == KPM_IOU_REQ_TYPE_READ)
-			worker_iou_handle_conn_recvzc(self, cqe);
+		switch (get_tag(cqe->user_data)) {
+			case KPM_IOU_REQ_TYPE_MAIN:
+				worker_iou_handle_main_sock(self, cqe);
+				break;
+			case KPM_IOU_REQ_TYPE_READ:
+				worker_iou_handle_read(self, cqe);
+				break;
+			case KPM_IOU_REQ_TYPE_RECVZC:
+				worker_iou_handle_recvzc(self, cqe);
+				break;
+			default:
+				err(1, "Unknown io_uring request type: %d, res: %d", get_tag(cqe->user_data), cqe->res);
+		}
 
 		count++;
 	}
 	io_uring_cq_advance(&self->ring, count);
 }
 
-static void
-worker_iou_add_test(struct worker_state *self, struct connection *conn)
+static void worker_iou_add_recvzc(struct io_uring *ring, struct connection *conn)
 {
 	struct io_uring_sqe *sqe;
 
-	if (conn->to_send)
-		errx(1, "io_uring doesn't support send yet");
+	sqe = io_uring_get_sqe(ring);
+	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, conn->fd, NULL, 0, 0);
+	sqe->ioprio |= IORING_RECV_MULTISHOT;
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_RECVZC));
+}
 
-	/*
+static void worker_iou_add_recv(struct io_uring *ring, struct connection *conn)
+{
+	struct io_uring_sqe *sqe;
 	size_t chunk;
 
 	chunk = min_t(size_t, conn->read_size, conn->to_recv);
-	conn->buf = malloc(conn->read_size);
-	*/
-
-	printf("----- adding recvzc req\n");
-	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, conn->fd, NULL, 0, 0);
-	sqe->ioprio |= IORING_RECV_MULTISHOT;
-	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
-
-	/* TODO: restore and generalise
-	sqe = io_uring_get_sqe(&self->ring);
+	conn->buf = malloc(chunk);
+	sqe = io_uring_get_sqe(ring);
 	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
-	*/
+}
+
+static void
+worker_iou_add_test(struct worker_state *self, struct connection *conn)
+{
+	if (conn->to_send)
+		errx(1, "io_uring doesn't support send yet");
+
+	if (self->iou_opts.zcrx) {
+		printf("----- add recvzc\n");
+		worker_iou_add_recvzc(&self->ring, conn);
+	} else {
+		printf("----- add recv\n");
+		worker_iou_add_recv(&self->ring, conn);
+	}
 }
 
 static void
@@ -1067,6 +1081,8 @@ worker_iou_stop_test(struct worker_state *self, struct connection *conn)
 {
 	struct io_uring_sqe *sqe;
 
+	printf("----- iou stop_test\n");
+	// TODO: fix this to clean up everything incl the ifq
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_cancel(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ), 0);
 }
@@ -1125,6 +1141,8 @@ void NORETURN pworker_main(int fd, struct iou_opts *opts)
 	}
 
 	kpm_info("exiting!");
+	printf("----- pworker_main exit\n");
+	// FIXME:
 	if (self.iou_opts.enable)
 		io_uring_queue_exit(&self.ring);
 	exit(0);
