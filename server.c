@@ -38,6 +38,9 @@ static struct {
 	.iou_opts	= {
 		.enable		= false,
 		.zcrx		= false,
+		.zcrx_pages	= 4096,
+		.zcrx_page_size	= 4096,
+		.zcrx_queue_id	= 0,
 	},
 };
 
@@ -55,6 +58,9 @@ static const struct opt_table opts[] = {
  			"kpeft server",	"Show this help message"),
 	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.iou_opts.enable, "Use io_uring"),
 	OPT_WITHOUT_ARG("--iou_zcrx", opt_set_bool, &opt.iou_opts.zcrx, "io_uring: Use zero copy Rx"),
+	OPT_WITH_ARG("--iou_pages", opt_set_ulongval, opt_show_ulongval, &opt.iou_opts.zcrx_pages, "io_uring"),
+	OPT_WITH_ARG("--iou_page_size", opt_set_ulongval, opt_show_ulongval, &opt.iou_opts.zcrx_page_size, "io_uring"),
+	OPT_WITH_ARG("--iou_queue_id", opt_set_ulongval, opt_show_ulongval, &opt.iou_opts.zcrx_queue_id, "io_uring"),
  	OPT_ENDTABLE
 };
 

@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <linux/tcp.h>
+#include <net/if.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/sysinfo.h>
 #include <liburing.h>
 
@@ -26,6 +28,15 @@
 #include "tcp.h"
 
 struct connection;
+struct iou_zcrx {
+	struct io_uring *ring;
+	void *area_base;
+	void *ring_ptr;
+	size_t area_size;
+	size_t ring_size;
+	struct io_uring_zcrx_rq rq_ring;
+	unsigned int ifindex;
+};
 
 /* Main worker state AKA self */
 struct worker_state {
@@ -41,6 +52,7 @@ struct worker_state {
 
 	struct iou_opts iou_opts;
 	struct io_uring ring;
+	struct iou_zcrx iou_zcrx;
 
 	int (*prep)(struct worker_state *);
 	void (*wait)(struct worker_state *);
@@ -814,11 +826,133 @@ static void worker_iou_handle_conn(struct worker_state *self, struct io_uring_cq
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
 }
 
+static unsigned char *iou_zcrx_get_data(struct iou_zcrx *zcrx, uint64_t off)
+{
+	uint64_t mask = (1ULL << IORING_ZCRX_AREA_SHIFT) - 1;
+	return (unsigned char *)zcrx->area_base + (off & mask);
+}
+
+static void iou_zcrx_recycle(struct iou_zcrx *zcrx, struct io_uring_cqe *cqe, struct io_uring_zcrx_cqe *rcqe)
+{
+	struct io_uring_zcrx_rqe* rqe;
+	unsigned mask = zcrx->rq_ring.ring_entries - 1;
+
+	rqe = &zcrx->rq_ring.rqes[(zcrx->rq_ring.rq_tail & mask)];
+	rqe->off = rcqe->off;
+	rqe->len = cqe->res;
+	zcrx->rq_ring.rq_tail++;
+
+	IO_URING_WRITE_ONCE(*zcrx->rq_ring.ktail, zcrx->rq_ring.rq_tail);
+}
+
+static void worker_iou_handle_conn_recvzc(struct worker_state *self, struct io_uring_cqe *cqe)
+{
+	struct io_uring_sqe *sqe;
+	struct connection *conn;
+	ssize_t n;
+	size_t chunk;
+	struct io_uring_zcrx_cqe* rcqe;
+	unsigned char *data;
+	struct iou_zcrx *zcrx;
+
+	if (!self->test)
+		return;
+
+	zcrx = &self->iou_zcrx;
+	conn = untag(cqe->user_data);
+
+	if (cqe->res == 0 && cqe->flags == 0) {
+		worker_kill_conn(self, conn);
+		return;
+	}
+
+	if (cqe->res < 0) {
+		warn("recvzc error: res=%d", cqe->res);
+		worker_kill_conn(self, conn);
+		return;
+	}
+
+	if (!(cqe->flags & IORING_CQE_F_MORE))
+		worker_add_test(self, conn);
+
+	rcqe = (struct io_uring_zcrx_cqe*)(cqe + 1);
+
+	n = cqe->res;
+	data = iou_zcrx_get_data(zcrx, rcqe->off);
+
+	void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
+	if (memcmp(data, src, n))
+		warnx("Data corruption %d %d %ld %lld %lld",
+		*data, *(char *)src, n,
+		conn->tot_recv % PATTERN_PERIOD,
+		conn->tot_recv);
+
+	conn->to_recv -= n;
+	conn->tot_recv += n;
+	if (!conn->to_recv) {
+		worker_recv_finished(self, conn);
+		if (conn->to_send)
+			errx(1, "Unexpected to_send w/ recv");
+	}
+
+	iou_zcrx_recycle(zcrx, cqe, rcqe);
+}
+
+static int worker_iou_zcrx_register(struct iou_zcrx *zcrx, struct iou_opts *opts)
+{
+	void *ring_ptr;
+	int errno_copy;
+	int ret;
+
+	struct io_uring_zcrx_area_reg area_reg = {
+		.addr = (__u64)(unsigned long)zcrx->area_base,
+		.len = zcrx->area_size,
+		.flags = 0,
+		.area_id = 0,
+	};
+
+	struct io_uring_zcrx_ifq_reg reg = {
+		.if_idx = zcrx->ifindex,
+		.if_rxq = opts->zcrx_queue_id,
+		.rq_entries = 4096,
+		.area_ptr = (__u64)(unsigned long)&area_reg,
+	};
+
+	ret = io_uring_register_ifq(zcrx->ring, &reg);
+	if (ret)
+		return ret;
+
+	ring_ptr = mmap(0,
+			reg.offsets.mmap_sz,
+			PROT_READ | PROT_WRITE,
+			MAP_SHARED | MAP_POPULATE,
+			zcrx->ring->enter_ring_fd,
+			IORING_OFF_RQ_RING);
+	if (ring_ptr == MAP_FAILED) {
+		errno_copy = errno;
+		return errno_copy;
+	}
+	zcrx->ring_ptr = ring_ptr;
+	zcrx->ring_size = reg.offsets.mmap_sz;
+
+	zcrx->rq_ring.khead = (unsigned int*)((char*)ring_ptr + reg.offsets.head);
+	zcrx->rq_ring.ktail = (unsigned int*)((char*)ring_ptr + reg.offsets.tail);
+	zcrx->rq_ring.rqes = (struct io_uring_zcrx_rqe*)((char*)ring_ptr + reg.offsets.rqes);
+	zcrx->rq_ring.rq_tail = 0;
+	zcrx->rq_ring.ring_entries = reg.rq_entries;
+
+	return 0;
+}
+
 static int
 worker_iou_prep(struct worker_state *self)
 {
+	struct iou_opts *opts = &self->iou_opts;
+	struct iou_zcrx *zcrx = &self->iou_zcrx;
 	struct io_uring_params p = {};
 	struct io_uring_sqe *sqe;
+	unsigned int ifindex;
+	void *area;
 	int ret;
 
 	p.flags |= IORING_SETUP_CQSIZE;
@@ -827,11 +961,34 @@ worker_iou_prep(struct worker_state *self)
 	p.flags |= IORING_SETUP_DEFER_TASKRUN;
 	p.flags |= IORING_SETUP_SUBMIT_ALL;
 	p.flags |= IORING_SETUP_R_DISABLED;
+	p.flags |= IORING_SETUP_CQE32;
 
 	p.cq_entries = 8192;
 	ret = io_uring_queue_init_params(64, &self->ring, &p);
 	if (ret < 0)
 		err(5, "Failed to create io_uring");
+	zcrx->ring = &self->ring;
+
+	// TODO: hard coded for now
+	ifindex = if_nametoindex("eth0");
+	if (!ifindex)
+		err(5, "Bad interface name: eth0");
+	zcrx->ifindex = ifindex;
+
+	zcrx->area_size = opts->zcrx_pages * opts->zcrx_page_size;
+	area = mmap(NULL,
+		    zcrx->area_size,
+		    PROT_READ | PROT_WRITE,
+		    MAP_ANONYMOUS | MAP_PRIVATE,
+		    0,
+		    0);
+	if (area == MAP_FAILED)
+		err(5, "Failed to mmap zero copy area");
+	zcrx->area_base = area;
+
+	ret = worker_iou_zcrx_register(zcrx, opts);
+	if (ret)
+		err(5, "Failed to register zcrx");
 
 	struct kpm_state *state;
 	state = malloc(sizeof(*state));
@@ -844,7 +1001,6 @@ worker_iou_prep(struct worker_state *self)
 	// TODO: permutations of options
 	// provided buffers
 	// fixed files
-	// zero copy rx
 
 	io_uring_enable_rings(&self->ring);
 	
@@ -871,7 +1027,7 @@ worker_iou_wait(struct worker_state *self)
 		if (sq_tag == KPM_IOU_REQ_TYPE_MAIN)
 			worker_iou_handle_main_sock(self, cqe);
 		else if (sq_tag == KPM_IOU_REQ_TYPE_READ)
-			worker_iou_handle_conn(self, cqe);
+			worker_iou_handle_conn_recvzc(self, cqe);
 
 		count++;
 	}
@@ -886,14 +1042,24 @@ worker_iou_add_test(struct worker_state *self, struct connection *conn)
 	if (conn->to_send)
 		errx(1, "io_uring doesn't support send yet");
 
+	/*
 	size_t chunk;
 
 	chunk = min_t(size_t, conn->read_size, conn->to_recv);
 	conn->buf = malloc(conn->read_size);
+	*/
 
+	printf("----- adding recvzc req\n");
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, conn->fd, NULL, 0, 0);
+	sqe->ioprio |= IORING_RECV_MULTISHOT;
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
+
+	/* TODO: restore and generalise
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
+	*/
 }
 
 static void
@@ -925,7 +1091,7 @@ void NORETURN pworker_main(int fd, struct iou_opts *opts)
 	list_head_init(&self.connections);
 	self.iou_opts = *opts;
 
-	if (self.iou_opts.enable)
+	if (opts->enable)
 		worker_setup_iou_fptrs(&self);
 	else
 		worker_setup_fptrs(&self);

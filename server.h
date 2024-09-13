@@ -13,6 +13,9 @@
 struct iou_opts {
 	bool enable;
 	bool zcrx;
+	unsigned long zcrx_pages;
+	unsigned long zcrx_page_size;
+	unsigned long zcrx_queue_id;
 };
 
 struct server_session {
