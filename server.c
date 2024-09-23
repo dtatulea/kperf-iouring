@@ -38,11 +38,12 @@ static struct {
 	.server_opts	= {
 		.accept_port	= 0,
 		.iou_opts	= {
-			.enable		= false,
-			.zcrx		= false,
-			.zcrx_pages	= 4096,
-			.zcrx_page_size	= 4096,
-			.zcrx_queue_id	= 0,
+			.enable			= false,
+			.zcrx			= false,
+			.zcrx_rq_entries	= 16384,
+			.zcrx_pages		= 16384,
+			.zcrx_page_size		= 4096,
+			.zcrx_queue_id		= 0,
 		},
 	},
 };
@@ -62,9 +63,10 @@ static const struct opt_table opts[] = {
 	OPT_WITH_ARG("--accept_port", opt_set_uintval, opt_show_uintval, &opt.server_opts.accept_port, "Accept port"),
 	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.server_opts.iou_opts.enable, "Use io_uring"),
 	OPT_WITHOUT_ARG("--iou_zcrx", opt_set_bool, &opt.server_opts.iou_opts.zcrx, "io_uring: Use zero copy Rx"),
-	OPT_WITH_ARG("--iou_pages", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_pages, "io_uring"),
-	OPT_WITH_ARG("--iou_page_size", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_page_size, "io_uring"),
-	OPT_WITH_ARG("--iou_queue_id", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_queue_id, "io_uring"),
+	OPT_WITH_ARG("--iou_zcrx_rq_entries", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_rq_entries, "io_uring"),
+	OPT_WITH_ARG("--iou_zcrx_pages", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_pages, "io_uring"),
+	OPT_WITH_ARG("--iou_zcrx_page_size", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_page_size, "io_uring"),
+	OPT_WITH_ARG("--iou_zcrx_queue_id", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_queue_id, "io_uring"),
  	OPT_ENDTABLE
 };
 

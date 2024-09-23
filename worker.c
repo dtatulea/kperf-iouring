@@ -606,11 +606,13 @@ worker_handle_recv(struct worker_state *self, struct connection *conn)
 			break;
 		}
 
+		/*
 		if (memcmp(buf, src, n))
 			warnx("Data corruption %d %d %ld %lld %lld %d",
 			      *buf, *(char *)src, n,
 			      conn->tot_recv % PATTERN_PERIOD,
 			      conn->tot_recv, rep);
+		*/
 
 		conn->to_recv -= n;
 		conn->tot_recv += n;
@@ -819,12 +821,14 @@ static void worker_iou_handle_read(struct worker_state *self, struct io_uring_cq
 	}
 
 	n = cqe->res;
+	/*
 	void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
 	if (memcmp(conn->buf, src, n))
 		warnx("Data corruption %d %d %ld %lld %lld",
 		*conn->buf, *(char *)src, n,
 		conn->tot_recv % PATTERN_PERIOD,
 		conn->tot_recv);
+	*/
 
 	conn->to_recv -= n;
 	conn->tot_recv += n;
@@ -919,15 +923,18 @@ static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_
 	n = cqe->res;
 	data = iou_zcrx_get_data(zcrx, rcqe->off);
 
+	/*
 	void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
 	if (memcmp(data, src, n))
 		warnx("Data corruption %d %d %ld %lld %lld",
 		*data, *(char *)src, n,
 		conn->tot_recv % PATTERN_PERIOD,
 		conn->tot_recv);
+	*/
 
 	conn->to_recv -= n;
 	conn->tot_recv += n;
+
 	if (!conn->to_recv) {
 		worker_recv_finished(self, conn);
 		if (conn->to_send)
@@ -950,11 +957,10 @@ static int worker_iou_zcrx_register(struct iou_zcrx *zcrx, struct iou_opts *opts
 		.area_id = 0,
 	};
 
-	printf("----- zcrx_register: queue id=%ld\n", opts->zcrx_queue_id);
 	struct io_uring_zcrx_ifq_reg reg = {
 		.if_idx = zcrx->ifindex,
 		.if_rxq = opts->zcrx_queue_id,
-		.rq_entries = 4096,
+		.rq_entries = opts->zcrx_rq_entries,
 		.area_ptr = (__u64)(unsigned long)&area_reg,
 	};
 
@@ -996,12 +1002,13 @@ static int worker_iou_prep_recvzc(struct worker_state *self, struct iou_opts *op
 	// TODO: hard coded for now
 	ifindex = if_nametoindex("eth0");
 	if (!ifindex) {
-		err(5, "Bad interface name: eth0");
+		err(5, "Bad interface name");
 		return 1;
 	}
 	zcrx->ifindex = ifindex;
 
 	zcrx->area_size = opts->zcrx_pages * opts->zcrx_page_size;
+	printf("----- area_size=%lu\n", zcrx->area_size);
 	area = mmap(NULL,
 		    zcrx->area_size,
 		    PROT_READ | PROT_WRITE,

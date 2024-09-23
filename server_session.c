@@ -162,7 +162,6 @@ server_msg_tcp_acceptor(struct session_state *self, struct kpm_header *req)
 		self->quit = 1;
 		return;
 	}
-	printf("----- tcp acceptor port=%u\n", self->opts.accept_port);
 	addr.sin6_port = htons(self->opts.accept_port);
 
 	self->tcp_sock = socket(addr.sin6_family, SOCK_STREAM, 0);
