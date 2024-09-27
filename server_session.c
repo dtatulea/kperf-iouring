@@ -36,7 +36,6 @@ struct session_state {
 	unsigned int connection_ids;
 	unsigned int worker_ids;
 	unsigned int test_ids;
-	unsigned int accept_port;
 	struct server_opts opts;
 
 	struct list_head connections;
@@ -526,7 +525,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		// NOTE: child
 		close(p[0]);
-		pworker_main(p[1], &self->opts.iou_opts);
+		pworker_main(p[1], &self->opts);
 		exit(1);
 	}
 

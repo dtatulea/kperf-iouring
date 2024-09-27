@@ -21,6 +21,7 @@ struct iou_opts {
 
 struct server_opts {
 	unsigned int accept_port;
+	bool memcmp;
 	struct iou_opts iou_opts;
 };
 
@@ -33,6 +34,6 @@ struct server_session {
 struct server_session *
 server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen, struct server_opts *opts);
 
-void NORETURN pworker_main(int fd, struct iou_opts *opts);
+void NORETURN pworker_main(int fd, struct server_opts *opts);
 
 #endif /* SERVER_H */

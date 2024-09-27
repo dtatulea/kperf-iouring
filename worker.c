@@ -49,6 +49,7 @@ struct worker_state {
 	struct timemono test_start;
 	struct timemono prev_loop;
 	unsigned int test_len_msec;
+	bool memcmp;
 
 	struct iou_opts iou_opts;
 	struct io_uring ring;
@@ -587,7 +588,6 @@ worker_handle_recv(struct worker_state *self, struct connection *conn)
 	}
 
 	while (rep--) {
-		void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
 		size_t chunk;
 		ssize_t n;
 
@@ -606,13 +606,14 @@ worker_handle_recv(struct worker_state *self, struct connection *conn)
 			break;
 		}
 
-		/*
-		if (memcmp(buf, src, n))
-			warnx("Data corruption %d %d %ld %lld %lld %d",
-			      *buf, *(char *)src, n,
-			      conn->tot_recv % PATTERN_PERIOD,
-			      conn->tot_recv, rep);
-		*/
+		if (self->memcmp) {
+			void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
+			if (memcmp(buf, src, n))
+				warnx("Data corruption %d %d %ld %lld %lld %d",
+				*buf, *(char *)src, n,
+				conn->tot_recv % PATTERN_PERIOD,
+				conn->tot_recv, rep);
+		}
 
 		conn->to_recv -= n;
 		conn->tot_recv += n;
@@ -821,14 +822,14 @@ static void worker_iou_handle_read(struct worker_state *self, struct io_uring_cq
 	}
 
 	n = cqe->res;
-	/*
-	void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
-	if (memcmp(conn->buf, src, n))
-		warnx("Data corruption %d %d %ld %lld %lld",
-		*conn->buf, *(char *)src, n,
-		conn->tot_recv % PATTERN_PERIOD,
-		conn->tot_recv);
-	*/
+	if (self->memcmp) {
+		void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
+		if (memcmp(conn->buf, src, n))
+			warnx("Data corruption %d %d %ld %lld %lld",
+			*conn->buf, *(char *)src, n,
+			conn->tot_recv % PATTERN_PERIOD,
+			conn->tot_recv);
+	}
 
 	conn->to_recv -= n;
 	conn->tot_recv += n;
@@ -923,14 +924,14 @@ static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_
 	n = cqe->res;
 	data = iou_zcrx_get_data(zcrx, rcqe->off);
 
-	/*
-	void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
-	if (memcmp(data, src, n))
-		warnx("Data corruption %d %d %ld %lld %lld",
-		*data, *(char *)src, n,
-		conn->tot_recv % PATTERN_PERIOD,
-		conn->tot_recv);
-	*/
+	if (self->memcmp) {
+		void *src = &patbuf[conn->tot_recv % PATTERN_PERIOD];
+		if (memcmp(data, src, n))
+			warnx("Data corruption %d %d %ld %lld %lld",
+			*data, *(char *)src, n,
+			conn->tot_recv % PATTERN_PERIOD,
+			conn->tot_recv);
+	}
 
 	conn->to_recv -= n;
 	conn->tot_recv += n;
@@ -1142,16 +1143,18 @@ worker_setup_iou_fptrs(struct worker_state *self)
 
 /* == Main loop == */
 
-void NORETURN pworker_main(int fd, struct iou_opts *opts)
+void NORETURN pworker_main(int fd, struct server_opts *opts)
 {
 	struct worker_state self = { .main_sock = fd, };
 	unsigned char j;
 	int i, ret;
 
 	list_head_init(&self.connections);
-	self.iou_opts = *opts;
+	self.memcmp = opts->memcmp;
+	self.iou_opts = opts->iou_opts;
+	printf("----- worker_main: memcmp=%d\n", self.memcmp);
 
-	if (opts->enable)
+	if (opts->iou_opts.enable)
 		worker_setup_iou_fptrs(&self);
 	else
 		worker_setup_fptrs(&self);
