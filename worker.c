@@ -1095,12 +1095,15 @@ static int worker_iou_prep_recvzc(struct worker_state *self, struct iou_opts *op
 
 	zcrx->area_size = opts->zcrx_pages * opts->zcrx_page_size;
 	printf("----- area_size=%lu\n", zcrx->area_size);
-	area = mmap(NULL,
-		    zcrx->area_size,
-		    PROT_READ | PROT_WRITE,
-		    MAP_ANONYMOUS | MAP_PRIVATE,
-		    0,
-		    0);
+	area = mmap(NULL, zcrx->area_size, PROT_READ | PROT_WRITE,
+		    MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGE_2MB,
+		    -1, 0);
+	if (area != MAP_FAILED) {
+		printf("----- Using 2MB huge pages\n");
+	} else {
+		area = mmap(NULL, zcrx->area_size, PROT_READ | PROT_WRITE,
+				MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	}
 	if (area == MAP_FAILED) {
 		err(5, "Failed to mmap zero copy area");
 		return 1;
