@@ -62,7 +62,7 @@ static struct {
 	.write_size = KPM_DFL_OP_CHUNK,
 	.time = 5,
 	.cpu_min = 0,
-	.cpu_max = 255,
+	.cpu_max = 512,
 	.cpu_src_wrk = -1,
 	.cpu_dst_wrk = -1,
 	.n_conns = 1,
