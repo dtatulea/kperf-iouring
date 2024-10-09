@@ -274,7 +274,7 @@ err_free_conns:
 static int spawn_worker(int fd, int cpu, __u32 *wid)
 {
 	struct __kpm_generic_u32 *id;
-	struct kpm_empty *ack;
+	struct kpm_empty *ack = NULL;
 	int seq;
 
 	seq = kpm_send_empty(fd, KPM_MSG_TYPE_SPAWN_PWORKER);
@@ -291,33 +291,34 @@ static int spawn_worker(int fd, int cpu, __u32 *wid)
 
 	if (!kpm_good_reply(id, KPM_MSG_TYPE_SPAWN_PWORKER, seq)) {
 		warnx("Invalid spawn ack %d %d", id->hdr.type, id->hdr.len);
-		free(id);
-		return 1;
+		goto err;
 	}
 
 	*wid = id->val;
-	free(id);
 
 	seq = kpm_send_pin_worker(fd, *wid, cpu);
 	if (seq < 0) {
 		warn("Failed to pin");
-		return 1;
+		goto err;
 	}
 
 	ack = kpm_receive(fd);
 	if (!ack) {
 		warnx("No ack for pin");
-		return 1;
+		goto err;
 	}
 
 	if (!kpm_good_reply(ack, KPM_MSG_TYPE_PIN_WORKER, seq)) {
 		warnx("Invalid ack for pin %d %d", id->hdr.type, id->hdr.len);
-		free(ack);
-		return 1;
+		goto err;
 	}
 	free(ack);
 
 	return 0;
+err:
+	free(ack);
+	free(id);
+	return 1;
 }
 
 static void
