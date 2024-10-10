@@ -1085,10 +1085,9 @@ static int worker_iou_prep_recvzc(struct worker_state *self, struct iou_opts *op
 
 	zcrx->ring = &self->ring;
 
-	// TODO: hard coded for now
-	ifindex = if_nametoindex("eth0");
+	ifindex = if_nametoindex(self->iou_opts.dev_name);
 	if (!ifindex) {
-		err(5, "Bad interface name");
+		err(5, "Bad interface name: %s", self->iou_opts.dev_name);
 		return 1;
 	}
 	zcrx->ifindex = ifindex;
@@ -1126,6 +1125,9 @@ worker_iou_prep(struct worker_state *self)
 	struct io_uring_params p = {};
 	struct io_uring_sqe *sqe;
 	int ret;
+
+	if (opts->zcrx && !opts->dev_name)
+		err(5, "Need device name for io_uring zero-copy rx");
 
 	p.flags |= IORING_SETUP_CQSIZE;
 	p.flags |= IORING_SETUP_COOP_TASKRUN;

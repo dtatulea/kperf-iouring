@@ -68,6 +68,7 @@ static const struct opt_table opts[] = {
 	OPT_WITHOUT_ARG("--no-memcmp", opt_set_invbool, &opt.server_opts.memcmp, "Do not memcmp payload on receiver side"),
 	OPT_WITHOUT_ARG("--iou", opt_set_bool, &opt.server_opts.iou_opts.enable, "Use io_uring"),
 	OPT_WITHOUT_ARG("--iou_zcrx", opt_set_bool, &opt.server_opts.iou_opts.zcrx, "io_uring: Use zero copy Rx"),
+	OPT_WITH_ARG("--iou_dev_name", opt_set_charp, opt_show_charp, &opt.server_opts.iou_opts.dev_name, "io_uring: device name"),
 	OPT_WITH_ARG("--iou_zcrx_rq_entries", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_rq_entries, "io_uring"),
 	OPT_WITH_ARG("--iou_zcrx_pages", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_pages, "io_uring"),
 	OPT_WITH_ARG("--iou_zcrx_page_size", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_page_size, "io_uring"),
