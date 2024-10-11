@@ -1240,6 +1240,7 @@ worker_iou_prep(struct worker_state *self)
 	// fixed files
 
 	io_uring_enable_rings(&self->ring);
+	io_uring_register_ring_fd(&self->ring);
 	
 	return 0;
 }
