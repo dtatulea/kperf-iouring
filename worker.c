@@ -44,6 +44,7 @@ struct iou_zcrx {
 /* Main worker state AKA self */
 struct worker_state {
 	int main_sock;
+	int iou_main_sock;
 	int epollfd;
 	unsigned int id;
 	int quit;
@@ -71,6 +72,7 @@ struct worker_state {
 struct connection {
 	unsigned int id;
 	int fd;
+	int iou_fd;
 	unsigned int read_size;
 	unsigned int write_size;
 	__u64 to_send;
@@ -609,7 +611,8 @@ static void __worker_iou_send(struct worker_state *self, struct connection *conn
 
 	chunk = min_t(size_t, conn->write_size, conn->to_send);
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_send(sqe, conn->fd, src, chunk, MSG_WAITALL);
+	io_uring_prep_send(sqe, conn->iou_fd, src, chunk, MSG_WAITALL);
+	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_SEND));
 }
 
@@ -621,7 +624,8 @@ static void worker_iou_send_zc(struct worker_state *self, struct connection *con
 
 	chunk = min_t(size_t, conn->write_size, conn->to_send);
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_send_zc_fixed(sqe, conn->fd, src, chunk, MSG_WAITALL, 0, IORING_RECVSEND_FIXED_BUF);
+	io_uring_prep_send_zc_fixed(sqe, conn->iou_fd, src, chunk, MSG_WAITALL, 0, IORING_RECVSEND_FIXED_BUF);
+	sqe->flags |= IOSQE_FIXED_FILE;
 	sqe->buf_index = 0;
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_SEND_ZC));
 }
@@ -865,7 +869,8 @@ static void worker_iou_handle_proto_hdr(struct worker_state *self, struct kpm_st
 	state->len = n;
 
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_recv(sqe, self->main_sock, state->buf + n, (hdr->len - n), 0);
+	io_uring_prep_recv(sqe, self->iou_main_sock, state->buf + n, (hdr->len - n), 0);
+	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
 }
 
@@ -906,7 +911,8 @@ static void worker_iou_handle_proto(struct worker_state *self, struct kpm_state 
 	
 	memset(state, 0, sizeof(*state));
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_recv(sqe, self->main_sock, state->buf, sizeof(struct kpm_header), 0);
+	io_uring_prep_recv(sqe, self->iou_main_sock, state->buf, sizeof(struct kpm_header), 0);
+	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
 }
 
@@ -972,7 +978,8 @@ static void worker_iou_handle_read(struct worker_state *self, struct io_uring_cq
 	chunk = min_t(size_t, conn->read_size, conn->to_recv);
 	memset(conn->buf, 0, conn->read_size);
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
+	io_uring_prep_recv(sqe, conn->iou_fd, conn->buf, chunk, 0);
+	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
 }
 
@@ -1000,8 +1007,9 @@ static void worker_iou_add_recvzc(struct io_uring *ring, struct connection *conn
 	struct io_uring_sqe *sqe;
 
 	sqe = io_uring_get_sqe(ring);
-	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, conn->fd, NULL, 0, 0);
+	io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, conn->iou_fd, NULL, 0, 0);
 	sqe->ioprio |= IORING_RECV_MULTISHOT;
+	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_RECVZC));
 }
 
@@ -1013,7 +1021,8 @@ static void worker_iou_add_recv(struct io_uring *ring, struct connection *conn)
 	chunk = min_t(size_t, conn->read_size, conn->to_recv);
 	conn->buf = malloc(chunk);
 	sqe = io_uring_get_sqe(ring);
-	io_uring_prep_recv(sqe, conn->fd, conn->buf, chunk, 0);
+	io_uring_prep_recv(sqe, conn->iou_fd, conn->buf, chunk, 0);
+	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
 }
 
@@ -1195,6 +1204,7 @@ worker_iou_prep(struct worker_state *self)
 	struct iou_opts *opts = &self->iou_opts;
 	struct io_uring_params p = {};
 	struct io_uring_sqe *sqe;
+	int fds[2];
 	int ret;
 
 	if (opts->zcrx && !opts->dev_name)
@@ -1212,6 +1222,15 @@ worker_iou_prep(struct worker_state *self)
 	ret = io_uring_queue_init_params(64, &self->ring, &p);
 	if (ret < 0)
 		err(5, "Failed to create io_uring");
+
+	fds[0] = self->main_sock;
+	fds[1] = -1;
+	ret = io_uring_register_files(&self->ring, fds, 2);
+	if (ret)
+		err(5, "Failed to register files: %d", ret);
+
+	/* main sock is index 0 in the fixed files */
+	self->iou_main_sock = 0;
 
 	if (opts->zcrx)
 		ret = worker_iou_prep_recvzc(self, opts);
@@ -1232,12 +1251,9 @@ worker_iou_prep(struct worker_state *self)
 	memset(state, 0, sizeof(*state));
 
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_recv(sqe, self->main_sock, state->buf, sizeof(struct kpm_header), 0);
+	io_uring_prep_recv(sqe, self->iou_main_sock, state->buf, sizeof(struct kpm_header), 0);
+	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
-
-	// TODO: permutations of options
-	// provided buffers
-	// fixed files
 
 	io_uring_enable_rings(&self->ring);
 	io_uring_register_ring_fd(&self->ring);
@@ -1287,6 +1303,14 @@ next:
 static void
 worker_iou_add_test(struct worker_state *self, struct connection *conn)
 {
+	int ret;
+
+	ret = io_uring_register_files_update(&self->ring, 1, &conn->fd, 1);
+	if (ret != 1)
+		err(5, "Failed to update connection fd: %d", ret);
+	/* conn fd is index 1 in the registered table */
+	conn->iou_fd = 1;
+
 	if (self->iou_opts.zcrx) {
 		printf("----- add recvzc\n");
 		worker_iou_add_recvzc(&self->ring, conn);
@@ -1305,7 +1329,8 @@ worker_iou_stop_test(struct worker_state *self, struct connection *conn)
 
 	printf("----- iou stop_test\n");
 	sqe = io_uring_get_sqe(&self->ring);
-	io_uring_prep_cancel_fd(sqe, conn->fd, 0);
+	io_uring_prep_cancel_fd(sqe, conn->iou_fd, IORING_ASYNC_CANCEL_FD_FIXED);
+	sqe->cancel_flags &= ~IORING_ASYNC_CANCEL_FD;
 	// FIXME: called from worker_kill_conn() which may not be ending test but only killing a conn
 	// need to submit the cancel fd req!
 }
