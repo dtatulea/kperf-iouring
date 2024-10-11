@@ -968,7 +968,7 @@ static void server_session_loop(int fd, struct server_opts *opts)
 		}
 	}
 
-	kpm_info("exiting!");
+	kpm_dbg("exiting!");
 
 	list_for_each_safe(&self.connections, conn, next, connections) {
 		close(conn->fd);
