@@ -1291,6 +1291,9 @@ worker_iou_wait(struct worker_state *self)
 			case KPM_IOU_REQ_TYPE_SEND_ZC:
 				worker_iou_handle_send(self, cqe);
 				break;
+			case RPM_IOU_REQ_TYPE_CANCEL:
+				/* nothing to do */
+				break;
 			default:
 				err(1, "Unknown io_uring request type: %d, res: %d", get_tag(cqe->user_data), cqe->res);
 		}
@@ -1331,8 +1334,9 @@ worker_iou_stop_test(struct worker_state *self, struct connection *conn)
 	sqe = io_uring_get_sqe(&self->ring);
 	io_uring_prep_cancel_fd(sqe, conn->iou_fd, IORING_ASYNC_CANCEL_FD_FIXED);
 	sqe->cancel_flags &= ~IORING_ASYNC_CANCEL_FD;
+	io_uring_sqe_set_data(sqe, tag(NULL, KPM_IOU_REQ_TYPE_SEND));
+	io_uring_submit(&self->ring);
 	// FIXME: called from worker_kill_conn() which may not be ending test but only killing a conn
-	// need to submit the cancel fd req!
 }
 
 static void
