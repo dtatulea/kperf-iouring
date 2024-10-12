@@ -1395,9 +1395,14 @@ void NORETURN pworker_main(int fd, struct server_opts *opts)
 		self.wait(&self);
 	}
 
-	kpm_dbg("exiting!");
-	// FIXME:io_uring not exiting properly
-	if (self.iou_opts.enable)
+	if (self.iou_opts.enable) {
+		if (self.iou_opts.send_zc)
+			io_uring_unregister_buffers(&self.ring);
+		io_uring_unregister_files(&self.ring);
 		io_uring_queue_exit(&self.ring);
+	}
+	free(patbuf);
+
+	kpm_dbg("exiting!");
 	exit(0);
 }
