@@ -961,8 +961,11 @@ static void server_session_loop(int fd, struct server_opts *opts)
 		int i, nfds;
 
 		nfds = epoll_wait(self.epollfd, events, ARRAY_SIZE(events), -1);
-		if (nfds < 0)
+		if (nfds < 0) {
+			if (errno == EINTR)
+				continue;
 			err(3, "Failed to epoll");
+		}
 
 		for (i = 0; i < nfds; i++) {
 			struct epoll_event *e = &events[i];
