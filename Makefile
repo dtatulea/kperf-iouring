@@ -23,7 +23,7 @@ $(CCAN_PATH)/libccan.a:
 	ar rcs $(CCAN_PATH)/libccan.a $(CCAN_PATH)/ccan/*/*.o
 
 liburing/src/liburing.a:
-	make -C liburing
+	make -C liburing library
 $(OBJECTS): submodule_liburing
 
 clean:
