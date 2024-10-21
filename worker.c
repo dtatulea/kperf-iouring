@@ -1120,7 +1120,6 @@ static int worker_iou_zcrx_register(struct iou_zcrx *zcrx, struct iou_opts *opts
 		.addr = (__u64)(unsigned long)zcrx->area_base,
 		.len = zcrx->area_size,
 		.flags = 0,
-		.area_id = 0,
 	};
 
 	struct io_uring_zcrx_ifq_reg reg = {
