@@ -1113,9 +1113,13 @@ static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_
 static int worker_iou_zcrx_register(struct iou_zcrx *zcrx, struct iou_opts *opts)
 {
 	void *ring_ptr;
-	int errno_copy;
 	int ret;
 
+	struct io_uring_region_desc region_reg = {
+		.size = zcrx->ring_size,
+		.user_addr = (__u64)(unsigned long)zcrx->ring_ptr,
+		.flags = IORING_MEM_REGION_TYPE_USER,
+	};
 	struct io_uring_zcrx_area_reg area_reg = {
 		.addr = (__u64)(unsigned long)zcrx->area_base,
 		.len = zcrx->area_size,
@@ -1127,25 +1131,14 @@ static int worker_iou_zcrx_register(struct iou_zcrx *zcrx, struct iou_opts *opts
 		.if_rxq = opts->zcrx_queue_id,
 		.rq_entries = opts->zcrx_rq_entries,
 		.area_ptr = (__u64)(unsigned long)&area_reg,
+		.region_ptr = (__u64)(unsigned long)&region_reg,
 	};
 
 	ret = io_uring_register_ifq(zcrx->ring, &reg);
 	if (ret)
 		return ret;
 
-	ring_ptr = mmap(0,
-			reg.offsets.mmap_sz,
-			PROT_READ | PROT_WRITE,
-			MAP_SHARED | MAP_POPULATE,
-			zcrx->ring->enter_ring_fd,
-			IORING_OFF_RQ_RING);
-	if (ring_ptr == MAP_FAILED) {
-		errno_copy = errno;
-		return errno_copy;
-	}
-	zcrx->ring_ptr = ring_ptr;
-	zcrx->ring_size = reg.offsets.mmap_sz;
-
+	ring_ptr = zcrx->ring_ptr;
 	zcrx->rq_ring.khead = (unsigned int*)((char*)ring_ptr + reg.offsets.head);
 	zcrx->rq_ring.ktail = (unsigned int*)((char*)ring_ptr + reg.offsets.tail);
 	zcrx->rq_ring.rqes = (struct io_uring_zcrx_rqe*)((char*)ring_ptr + reg.offsets.rqes);
@@ -1187,6 +1180,15 @@ static int worker_iou_prep_recvzc(struct worker_state *self, struct iou_opts *op
 		return 1;
 	}
 	zcrx->area_base = area;
+
+	zcrx->ring_size = (opts->zcrx_rq_entries * sizeof(struct io_uring_region_desc)) + opts->zcrx_page_size;
+	zcrx->ring_size = (zcrx->ring_size + (opts->zcrx_page_size - 1)) & ~(opts->zcrx_page_size - 1);
+	zcrx->ring_ptr = mmap(NULL, zcrx->ring_size, PROT_READ | PROT_WRITE,
+		    MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+	if (zcrx->ring_ptr == MAP_FAILED) {
+		err(5, "Failed to mmap ring area. ring size: %lu", zcrx->ring_size);
+		return 1;
+	}
 
 	ret = worker_iou_zcrx_register(zcrx, opts);
 	if (ret) {
